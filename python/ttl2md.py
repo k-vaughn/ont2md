@@ -188,23 +188,6 @@ def main():
     for ont_name, ont in ontology_info.items():
         ttl_path = ont["file"]
         temp_g = Graph()
-        shared_shacl = "/Users/kvaughn/GitHub/ontology-its-core/docs/its-sh.ttl"
-        if os.path.exists(shared_shacl):
-            try:
-                temp_g.parse(shared_shacl, format="turtle")
-            except BadSyntax as e:
-                line_no = getattr(e, "lines", None)
-                col = getattr(e, "column", None)
-                msg = str(e) if str(e) else "BadSyntax while parsing Turtle"
-                ctx = _format_syntax_context(shared_shacl, line_no)
-                loc = f"line {line_no}" + (f", col {col}" if col is not None else "") if line_no else "unknown location"
-                log.error("Error parsing shared SHACL file %s at %s.\n%s\n%s", shared_shacl, loc, msg, ctx)
-                # Graceful exit: we explicitly want the user to see location info,
-                # but we do not want a long traceback or partial site generation.
-                sys.exit(2)
-            except Exception as e:
-                log.error("Error parsing shared SHACL file %s (%s)", shared_shacl, str(e))
-                sys.exit(2)
         temp_g.parse(ttl_path, format="turtle")
 
         direct_imports = []   

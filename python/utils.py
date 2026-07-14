@@ -14,6 +14,144 @@ log = logging.getLogger("ttl2mkdocs")
 DESC_PROPS = (DC.description, SKOS.definition, RDFS.comment, DCTERMS.description)
 SKIP_IN_OTHER = set(DESC_PROPS) | {RDFS.label, DCTERMS.description, SKOS.note, SKOS.example}
 
+
+def load_oasis_catalog(catalog_path: str) -> dict:
+    """
+    Parse an OASIS XML catalog into {name IRI -> local path or URL}.
+
+    Relative catalog `uri` values are resolved against the catalog file's directory.
+    `file:` URIs are converted to filesystem paths. Supports `<uri name="..." uri="..."/>`
+    entries (with or without XML namespace).
+    """
+    import xml.etree.ElementTree as ET
+    from urllib.parse import urlparse
+    from urllib.request import url2pathname
+
+    mapping = {}
+    if not catalog_path or not os.path.isfile(catalog_path):
+        return mapping
+    try:
+        tree = ET.parse(catalog_path)
+    except Exception as e:
+        log.warning("Could not parse catalog %s: %s", catalog_path, e)
+        return mapping
+
+    catalog_dir = os.path.dirname(os.path.abspath(catalog_path))
+    root = tree.getroot()
+    for el in root.iter():
+        if not str(el.tag).endswith("uri"):
+            continue
+        name = el.get("name")
+        href = el.get("uri")
+        if not name or not href:
+            continue
+        if href.startswith("file:"):
+            target = url2pathname(urlparse(href).path)
+        elif os.path.isabs(href) or "://" in href:
+            target = href
+        else:
+            target = os.path.normpath(os.path.join(catalog_dir, href))
+        mapping[name] = target
+        mapping[name.rstrip("/")] = target
+        if not name.endswith("/"):
+            mapping[name + "/"] = target
+    log.info("Loaded catalog URI mappings from %s (%d names)", catalog_path, len({k.rstrip("/") for k in mapping}))
+    return mapping
+
+
+def discover_oasis_catalogs(search_roots: Optional[Iterable[str]] = None) -> dict:
+    """
+    Merge OASIS catalogs found in common locations (later files override earlier).
+
+    Search order (portable):
+      - $ONT2MD_CATALOG if set (relative paths resolved from cwd)
+      - ./catalog-v001.xml, ./catalog.xml
+      - ./docs/catalog-v001.xml, ./docs/catalog.xml
+      - plus the same under each path in search_roots
+    """
+    merged = {}
+    candidates = []
+    env = os.environ.get("ONT2MD_CATALOG")
+    if env:
+        candidates.append(
+            os.path.normpath(os.path.join(os.getcwd(), env)) if not os.path.isabs(env) else env
+        )
+    base_roots = [os.getcwd(), os.path.join(os.getcwd(), "docs")]
+    if search_roots:
+        base_roots.extend(search_roots)
+    for root in base_roots:
+        for name in ("catalog-v001.xml", "catalog.xml"):
+            candidates.append(os.path.join(root, name))
+
+    seen = set()
+    for path in candidates:
+        if not (os.path.isfile(path) and path.lower().endswith(".xml")):
+            continue
+        ap = os.path.abspath(path)
+        if ap in seen:
+            continue
+        seen.add(ap)
+        merged.update(load_oasis_catalog(ap))
+    return merged
+
+
+def resolve_iri_via_catalog(iri: str, catalog: dict) -> Optional[str]:
+    """
+    Resolve an IRI via catalog.
+
+    Exact matches always apply. Prefix matches apply only when the catalog
+    name is a namespace-style prefix (ends with '/') and the target is a
+    directory (or directory-like URI), so a mapping of a whole ontology IRI
+    onto a single .owl/.ttl file is not accidentally reused for child IRIs.
+    """
+    if not catalog:
+        return None
+
+    def _usable(target: Optional[str]) -> Optional[str]:
+        if not target:
+            return None
+        # Local path that does not exist → treat as unresolved so callers can
+        # fall back to fetching the original IRI (common with machine-specific
+        # Protégé file: catalogs checked out elsewhere).
+        if "://" not in target and not os.path.exists(target):
+            log.debug("Catalog target missing on disk, ignoring: %s", target)
+            return None
+        return target
+
+    if iri in catalog:
+        return _usable(catalog[iri])
+    alt = iri.rstrip("/")
+    if alt in catalog:
+        return _usable(catalog[alt])
+    if (alt + "/") in catalog:
+        return _usable(catalog[alt + "/"])
+
+    best_name = None
+    for name, target in catalog.items():
+        if not name.endswith("/"):
+            continue
+        if not iri.startswith(name):
+            continue
+        is_dir_target = (
+            target.endswith("/")
+            or target.endswith(os.sep)
+            or os.path.isdir(target)
+        )
+        if not is_dir_target:
+            continue
+        if best_name is None or len(name) > len(best_name):
+            best_name = name
+    if best_name is None:
+        return None
+    base = catalog[best_name]
+    remainder = iri[len(best_name) :]
+    if "://" in base:
+        return base.rstrip("/") + "/" + remainder.lstrip("/")
+    if not remainder:
+        return _usable(base)
+    return _usable(os.path.normpath(os.path.join(base, remainder)))
+
+
 def _norm_base(u: str) -> str:
     return u.rstrip('/#')
 

@@ -97,9 +97,17 @@ On classes, prefer `skos:definition`, `skos:example`, and `skos:note` where appl
 - Without `--create-missing`, rows are emitted only for concepts that already have a ReqView ID.
 - `ITSThing` and `TimeThing` are omitted from the CSV.
 
-### Optional shared SHACL
+### owl:imports
 
-If the file `ontology-its-core/docs/its-sh.ttl` exists at a configured path on the machine running the script, it is parsed when resolving `owl:imports` for pattern modules. Invalid syntax in that file aborts the run (exit `2`).
+After loading every `docs/*.ttl` file, the script recursively follows `owl:imports`:
+
+1. Skip IRIs already present as an `owl:Ontology` from local files
+2. Resolve via an OASIS XML catalog if present (`catalog-v001.xml` / `catalog.xml` in the project root or `docs/`, or `$ONT2MD_CATALOG`)
+3. Otherwise open/fetch the import IRI (HTTP(S) or local path)
+
+Imported graphs contribute constraints and external types used in diagrams. **Generated class pages stay limited to the project’s master namespace**, so documentation does not spawn pages for every foreign class.
+
+Catalog entries should use portable relative paths (resolved against the catalog file’s directory), not machine-specific absolute paths.
 
 ### Concept registry (optional)
 
