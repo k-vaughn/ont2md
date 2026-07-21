@@ -1,5 +1,6 @@
 # diagram_generator.py
 import os
+import html
 import logging
 import traceback
 from rdflib import Graph, URIRef, Literal
@@ -16,6 +17,22 @@ from utils import (
 
 # Configure logging
 log = logging.getLogger("ttl2mkdocs")
+
+
+def _format_edge_label(label: str) -> str:
+    """Render an association label as padded HTML so text does not sit on the stroke.
+
+    Thin letters (i, l, …) otherwise often collide with the edge line. A white
+    background plus cell padding keeps a readable gap around the name.
+    """
+    rows = "".join(
+        f'<TR><TD ALIGN="CENTER">{html.escape(line)}</TD></TR>'
+        for line in str(label).split("\n")
+    )
+    return (
+        f'<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="0" '
+        f'CELLPADDING="4" BGCOLOR="white">{rows}</TABLE>>'
+    )
 
 def get_target_info(g: Graph, expr, cls_name: str, ns: str, prefix_map: dict) -> tuple:
     """Get target information for a property's range, handling complex expressions."""
@@ -195,6 +212,7 @@ def generate_diagram(g: Graph, cls: URIRef, cls_name: str, cls_id: str, ns: str,
             super_ids.append(sup_id)
 
     # === MAIN CLASS NODE WITH DATATYPE PROPERTIES ===
+    needs_unique_lang_note = False
     with dot.subgraph() as main_group:
         main_group.attr(rank='max')
         data_props = defaultdict(list)   # datatype properties
@@ -241,6 +259,18 @@ def generate_diagram(g: Graph, cls: URIRef, cls_name: str, cls_id: str, ns: str,
                         hv_str = f"'{has_value}'" if isinstance(has_value, Literal) else get_qname(has_value, ns, prefix_map)
                         label_parts.append(f"value {hv_str}")
 
+                    # OWL 2 datatype restrictions (and common mis-encoding via onClass)
+                    on_data_range = g.value(restriction, OWL.onDataRange)
+                    if on_data_range and not datatype:
+                        datatype = get_qname(on_data_range, ns, prefix_map)
+                    on_class = g.value(restriction, OWL.onClass)
+                    if on_class and not datatype:
+                        datatype = get_qname(on_class, ns, prefix_map)
+                    if not datatype:
+                        prop_range = g.value(base_prop, RDFS.range)
+                        if prop_range:
+                            datatype = get_qname(prop_range, ns, prefix_map)
+
                     key = prop_name
                     if key not in data_props:
                         data_props[key] = {'label_parts': [], 'style': style, 'datatype': datatype}
@@ -267,6 +297,8 @@ def generate_diagram(g: Graph, cls: URIRef, cls_name: str, cls_id: str, ns: str,
                     data_props[prop_name]['datatype'] = data['datatype']
                 if 'multiplicity' in data:
                     data_props[prop_name]['multiplicity'] = data['multiplicity']
+                if data.get('uniqueLang'):
+                    data_props[prop_name]['uniqueLang'] = True
 
 
         # Build attribute rows — UML style
@@ -280,6 +312,10 @@ def generate_diagram(g: Graph, cls: URIRef, cls_name: str, cls_id: str, ns: str,
 
             if mult:
                 attr_label += f" [{mult}]"
+
+            if data.get('uniqueLang'):
+                attr_label += "¹"
+                needs_unique_lang_note = True
 
             if style == "dashed":
                 attr_label = f"redefines {attr_label}"
@@ -306,7 +342,16 @@ def generate_diagram(g: Graph, cls: URIRef, cls_name: str, cls_id: str, ns: str,
             if not prop:
                 continue
             prop_name, is_inverse, base_prop = get_property_info(g, prop, ns, prefix_map)
-            if base_prop and (base_prop, RDF.type, OWL.ObjectProperty) in g:
+            # Prefer an explicit ObjectProperty type; if the declaring ontology
+            # failed to load, still treat class-valued restrictions as associations
+            # unless the property is explicitly a DatatypeProperty.
+            is_object = bool(base_prop) and (base_prop, RDF.type, OWL.ObjectProperty) in g
+            if base_prop and not is_object and (base_prop, RDF.type, OWL.DatatypeProperty) not in g:
+                if (g.value(restriction, OWL.onClass)
+                        or g.value(restriction, OWL.allValuesFrom)
+                        or g.value(restriction, OWL.someValuesFrom)) and not g.value(restriction, OWL.onDataRange):
+                    is_object = True
+            if is_object:
                 is_refined = is_refined_property(g, cls, base_prop, restriction)
                 style = "dashed" if is_refined else "solid"
                 label_parts = []
@@ -323,7 +368,7 @@ def generate_diagram(g: Graph, cls: URIRef, cls_name: str, cls_id: str, ns: str,
                     label_parts.append(f"min {min_qualified_card}")
                 if max_qualified_card:
                     label_parts.append(f"max {max_qualified_card}")
-                if label_parts and on_class:
+                if on_class:
                     target_expr = on_class
 
                 all_values_from = g.value(restriction, OWL.allValuesFrom)
@@ -349,7 +394,10 @@ def generate_diagram(g: Graph, cls: URIRef, cls_name: str, cls_id: str, ns: str,
                 if label_parts and not target_expr:
                     target_expr = OWL.Thing
 
-                if target_expr and label_parts:
+                if target_expr:
+                    if not label_parts and target_expr == OWL.Thing:
+                        # Cardinality-only with no range is not useful on the diagram
+                        continue
                     if isinstance(target_expr, URIRef):
                         associated_uris.add(target_expr)
                     else:
@@ -369,6 +417,7 @@ def generate_diagram(g: Graph, cls: URIRef, cls_name: str, cls_id: str, ns: str,
                     if key not in combined:
                         combined[key] = {
                             'label_parts': [],
+                            'multiplicity': None,
                             'style': style,
                             'prop_name': prop_name,
                             'target_expr': target_expr,
@@ -378,6 +427,8 @@ def generate_diagram(g: Graph, cls: URIRef, cls_name: str, cls_id: str, ns: str,
                             'enum_members': oneOf_members,
                             'enum_name': enum_name
                         }
+                    combined[key].setdefault('label_parts', [])
+                    combined[key].setdefault('multiplicity', None)
                     combined[key]['label_parts'].extend(label_parts)
                     combined[key]['style'] = "dashed" if is_refined else combined[key]['style']
 
@@ -396,15 +447,34 @@ def generate_diagram(g: Graph, cls: URIRef, cls_name: str, cls_id: str, ns: str,
                 break
 
         if prop_uri:
-            # Determine target from SHACL sh:class if present
-            target_expr = OWL.Thing
+            # Target: sh:class, else non-literal sh:datatype (mis-encoded class),
+            # else rdfs:range / schema:rangeIncludes. Avoid bare owl:Thing when
+            # the property already declares a range.
+            target_expr = None
             for shape in g.subjects(SH.targetClass, cls):
                 for prop_shape in g.objects(shape, SH.property):
-                    if g.value(prop_shape, SH.path) == prop_uri:
-                        sh_class = g.value(prop_shape, SH['class'])
-                        if sh_class:
-                            target_expr = sh_class
+                    if g.value(prop_shape, SH.path) != prop_uri:
+                        continue
+                    sh_class = g.value(prop_shape, SH['class'])
+                    if sh_class:
+                        target_expr = sh_class
                         break
+                    sh_datatype = g.value(prop_shape, SH.datatype)
+                    if sh_datatype and isinstance(sh_datatype, URIRef):
+                        dt = str(sh_datatype)
+                        if not (dt.startswith("http://www.w3.org/2001/XMLSchema#")
+                                or dt.endswith("langString")
+                                or dt.endswith("#string")):
+                            target_expr = sh_datatype
+                            break
+                if target_expr:
+                    break
+            if target_expr is None:
+                target_expr = (
+                    g.value(prop_uri, RDFS.range)
+                    or g.value(prop_uri, URIRef("http://schema.org/rangeIncludes"))
+                    or OWL.Thing
+                )
 
             # Collect associated URIs
             if isinstance(target_expr, URIRef):
@@ -438,8 +508,8 @@ def generate_diagram(g: Graph, cls: URIRef, cls_name: str, cls_id: str, ns: str,
             if prop_name in shacl_data and 'multiplicity' in shacl_data[prop_name]:
                 combined[key]['multiplicity'] = shacl_data[prop_name]['multiplicity']
 
-            log.debug("Merged SHACL object property %s: constraints=%s (range skipped)", 
-                     prop_name, combined[key]['multiplicity'])
+            log.debug("Merged SHACL object property %s: constraints=%s (range skipped)",
+                     prop_name, combined[key].get('multiplicity'))
 
     # Remove self and supers from associated
     associated_uris -= {cls}
@@ -469,6 +539,7 @@ def generate_diagram(g: Graph, cls: URIRef, cls_name: str, cls_id: str, ns: str,
 
     # Add object property edges (unchanged)
     created_complex = set()  # reset for targets
+    super_id_set = set(super_ids)
     for key, data in combined.items():
         prop_name = data['prop_name']
         style = data.get('style', 'solid')
@@ -489,6 +560,7 @@ def generate_diagram(g: Graph, cls: URIRef, cls_name: str, cls_id: str, ns: str,
 
         if style == "dashed":
             label = f"redefines\n{label}"
+        label = _format_edge_label(label)
 
         target_id, _ = add_class_expression_node(dot, g, data['target_expr'], ns, prefix_map, 
                                                  global_all_classes, ns_to_ontology, abstract_map, 
@@ -500,7 +572,30 @@ def generate_diagram(g: Graph, cls: URIRef, cls_name: str, cls_id: str, ns: str,
         if reflexive:
             dot.edge(cls_id, cls_id, label=label, style=style, arrowhead=arrowhead)
         else:
-            dot.edge(source_id, dest_id, label=label, style=style, arrowhead=arrowhead)
+            # Association to a superclass shares endpoints with the generalization
+            # edge; route via east ports so the arrows do not overlap.
+            edge_attrs = {"label": label, "style": style, "arrowhead": arrowhead}
+            if dest_id in super_id_set or source_id in super_id_set:
+                edge_attrs["constraint"] = "false"
+                dot.edge(f"{source_id}:e", f"{dest_id}:e", **edge_attrs)
+            else:
+                dot.edge(source_id, dest_id, **edge_attrs)
+
+    # Figure note for multilingual (uniqueLang / *MultilingualShape) attributes —
+    # placed after associations so it sits at the bottom of the figure.
+    if needs_unique_lang_note:
+        note_id = f"{cls_id}_uniqueLang_note"
+        dot.node(
+            note_id,
+            label=(
+                '<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="0" CELLPADDING="2">'
+                '<TR><TD ALIGN="LEFT"><I>¹ Limited to one rdf:langString value per language</I></TD></TR>'
+                '</TABLE>>'
+            ),
+            margin="0",
+        )
+        anchor = assoc_nodes[-1] if assoc_nodes else cls_id
+        dot.edge(anchor, note_id, style="invis")
 
     # Save and render
     try:

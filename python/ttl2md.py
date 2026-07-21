@@ -2,6 +2,7 @@
 import os
 import sys
 import logging
+import shutil
 import traceback
 from collections import defaultdict
 from rdflib import Graph, RDF, OWL, URIRef
@@ -17,7 +18,8 @@ from markdown_generator import (
 from utils import (
     get_qname, get_label, is_abstract, get_id,
     get_ontology_metadata, insert_spaces, get_preferred_prefix,
-    resolve_home_ontology,
+    resolve_home_ontology, load_dev_iri_map, find_dev_iri_map_path,
+    describe_dev_iri_map_search,
 )
 from reqview_csv_generator import generate_reqview_update_csv
 
@@ -27,6 +29,17 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
 )
 log = logging.getLogger("ttl2mkdocs")
+
+
+def _reset_generated_output_dirs(docs_dir: str) -> None:
+    """Remove and recreate generated output dirs so stale pages/diagrams are not left behind."""
+    for name in ("classes", "properties", "diagrams"):
+        path = os.path.join(docs_dir, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+            log.info(f"Cleared {path}")
+        os.makedirs(path, exist_ok=True)
+
 
 def _format_syntax_context(path: str, line_no: int | None, window: int = 4) -> str:
     if not line_no or line_no <= 0:
@@ -53,13 +66,29 @@ def main():
     create_missing = False
     if "--create-missing" in sys.argv or "-c" in sys.argv:
         create_missing = True
-        # Remove the flag from sys.argv so it doesn't interfere with other logic
         sys.argv = [arg for arg in sys.argv if arg not in ("--create-missing", "-c")]
 
-    # Basic usage check (now allows the flag)
+    dev_mode = False
+    if "--dev" in sys.argv or "-dev" in sys.argv:
+        dev_mode = True
+        sys.argv = [arg for arg in sys.argv if arg not in ("--dev", "-dev")]
+
+    dev_map_path = None
+    if "--dev-map" in sys.argv:
+        idx = sys.argv.index("--dev-map")
+        if idx + 1 >= len(sys.argv):
+            print("Error: --dev-map requires a file path")
+            sys.exit(1)
+        dev_map_path = sys.argv[idx + 1]
+        # --dev-map implies --dev
+        dev_mode = True
+        del sys.argv[idx:idx + 2]
+
     if len(sys.argv) != 1:
-        print("Usage: python ttl2md.py [--create-missing | -c]")
+        print("Usage: python ttl2md.py [--create-missing | -c] [--dev | -dev] [--dev-map PATH]")
         print("       --create-missing, -c   Include concepts without ReqView ID (will create new objects in ReqView)")
+        print("       --dev, -dev            Remap owl:imports via a local per-user map file (not published IRIs)")
+        print("       --dev-map PATH         Path to IRI map (implies --dev); default: ./dev-iri-map.yml")
         sys.exit(1)
 
     root_dir = os.getcwd()
@@ -88,9 +117,43 @@ def main():
     errors = []
     processed_count = 0
 
+    # Optional per-user local remaps (only when --dev / --dev-map is given)
+    dev_map = None
+    if dev_mode:
+        map_file = find_dev_iri_map_path(dev_map_path, search_roots=[root_dir, docs_dir])
+        if not map_file:
+            print("Error: --dev requires a local IRI map file.")
+            print("       Copy dev-iri-map.example.yml → dev-iri-map.yml (gitignored),")
+            print("       or place one at ~/.config/ont2md/dev-iri-map.yml,")
+            print("       or pass --dev-map PATH")
+            print("       Looked for:")
+            for p in describe_dev_iri_map_search(search_roots=[root_dir, docs_dir])[:12]:
+                print(f"         - {p}")
+            sys.exit(1)
+        if "example" in os.path.basename(map_file).lower():
+            print(
+                f"Note: using example map {map_file}\n"
+                f"      Copy it to dev-iri-map.yml (or ~/.config/ont2md/dev-iri-map.yml) "
+                f"for your personal paths."
+            )
+        try:
+            dev_map = load_dev_iri_map(map_file)
+        except Exception as e:
+            print(f"Error loading dev IRI map: {e}")
+            sys.exit(1)
+        banner = (
+            f"*** DEV MODE *** Remapping owl:imports via {map_file}\n"
+            f"                 Published w3id/HTTP sources are NOT used for mapped IRIs.\n"
+            f"                 Omit --dev to fetch the live published ontologies."
+        )
+        print(banner)
+        log.warning(banner)
+
     # === 1. Load ALL TTL files into one unified graph ===
     try:
-        g, ns, prefix_map, all_classes, local_classes, prop_map = process_ttl_files(ttl_files, errors)
+        g, ns, prefix_map, all_classes, local_classes, prop_map = process_ttl_files(
+            ttl_files, errors, dev_map=dev_map
+        )
     except Exception as e:
         log.error(f"Failed to process TTL files: {e}")
         sys.exit(1)
@@ -111,7 +174,9 @@ def main():
 
     for ttl_path in ttl_files:
         base_name = os.path.splitext(os.path.basename(ttl_path))[0]
-        if base_name.endswith('-shacl'):
+        # SHACL and alignment modules contribute triples via process_ttl_files,
+        # but are not pattern/nav modules of their own.
+        if base_name.endswith('-shacl') or base_name.endswith('-alignment'):
             continue
 
         ont_name = base_name.replace('-pattern', '')   # e.g. fuzzy-time-pattern.ttl → fuzzy-time
@@ -143,11 +208,12 @@ def main():
         if not module_name:
             module_name = ont_name
 
+        # Nav/pages only for classes in this ontology's master namespace.
+        # Foreign IRIs (e.g. alignment subclass targets) must not get local pages.
         direct_classes = set()
         for s in temp_g.subjects(RDF.type, OWL.Class):
-            if isinstance(s, URIRef):
+            if isinstance(s, URIRef) and str(s).startswith(ns):
                 cls_name = get_label(temp_g, s) or get_qname(s, ns, prefix_map)
-#                if cls_name not in ('ITSThing', 'TimeThing'):
                 direct_classes.add(cls_name)
 
         # Direct properties defined in this module (used for nav grouping)
@@ -188,23 +254,6 @@ def main():
     for ont_name, ont in ontology_info.items():
         ttl_path = ont["file"]
         temp_g = Graph()
-        shared_shacl = "/Users/kvaughn/GitHub/ontology-its-core/docs/its-sh.ttl"
-        if os.path.exists(shared_shacl):
-            try:
-                temp_g.parse(shared_shacl, format="turtle")
-            except BadSyntax as e:
-                line_no = getattr(e, "lines", None)
-                col = getattr(e, "column", None)
-                msg = str(e) if str(e) else "BadSyntax while parsing Turtle"
-                ctx = _format_syntax_context(shared_shacl, line_no)
-                loc = f"line {line_no}" + (f", col {col}" if col is not None else "") if line_no else "unknown location"
-                log.error("Error parsing shared SHACL file %s at %s.\n%s\n%s", shared_shacl, loc, msg, ctx)
-                # Graceful exit: we explicitly want the user to see location info,
-                # but we do not want a long traceback or partial site generation.
-                sys.exit(2)
-            except Exception as e:
-                log.error("Error parsing shared SHACL file %s (%s)", shared_shacl, str(e))
-                sys.exit(2)
         temp_g.parse(ttl_path, format="turtle")
 
         direct_imports = []   
@@ -221,6 +270,8 @@ def main():
     for name, data in ontology_info.items():
         log.debug(f"  • {name}: {len(data['classes'])} direct classes")
 
+    # Drop stale generated pages/diagrams before rewriting (after TTL parse succeeds)
+    _reset_generated_output_dirs(docs_dir)
 
     # === 3. Generate diagrams + Markdown for every class ===
     for cls in sorted(local_classes, key=lambda u: get_label(g, u).lower()):
@@ -255,9 +306,6 @@ def main():
             log.error(error_msg)
 
     # === 4. Generate property documentation pages ===
-    prop_dir = os.path.join(docs_dir, "properties")
-    os.makedirs(prop_dir, exist_ok=True)
-
     for prop_qname, prop_uri in prop_map.items():   # prop_map from process_ttl_files
         if str(prop_uri).startswith(ns):            # only local properties
             generate_property_markdown(

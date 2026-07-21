@@ -14,6 +14,424 @@ log = logging.getLogger("ttl2mkdocs")
 DESC_PROPS = (DC.description, SKOS.definition, RDFS.comment, DCTERMS.description)
 SKIP_IN_OTHER = set(DESC_PROPS) | {RDFS.label, DCTERMS.description, SKOS.note, SKOS.example}
 
+
+def load_oasis_catalog(catalog_path: str) -> dict:
+    """
+    Parse an OASIS XML catalog into {name IRI -> local path or URL}.
+
+    Relative catalog `uri` values are resolved against the catalog file's directory.
+    `file:` URIs are converted to filesystem paths. Supports `<uri name="..." uri="..."/>`
+    entries (with or without XML namespace).
+    """
+    import xml.etree.ElementTree as ET
+    from urllib.parse import urlparse
+    from urllib.request import url2pathname
+
+    mapping = {}
+    if not catalog_path or not os.path.isfile(catalog_path):
+        return mapping
+    try:
+        tree = ET.parse(catalog_path)
+    except Exception as e:
+        log.warning("Could not parse catalog %s: %s", catalog_path, e)
+        return mapping
+
+    catalog_dir = os.path.dirname(os.path.abspath(catalog_path))
+    root = tree.getroot()
+    for el in root.iter():
+        if not str(el.tag).endswith("uri"):
+            continue
+        name = el.get("name")
+        href = el.get("uri")
+        if not name or not href:
+            continue
+        if href.startswith("file:"):
+            target = url2pathname(urlparse(href).path)
+        elif os.path.isabs(href) or "://" in href:
+            target = href
+        else:
+            target = os.path.normpath(os.path.join(catalog_dir, href))
+        mapping[name] = target
+        mapping[name.rstrip("/")] = target
+        if not name.endswith("/"):
+            mapping[name + "/"] = target
+    log.info("Loaded catalog URI mappings from %s (%d names)", catalog_path, len({k.rstrip("/") for k in mapping}))
+    return mapping
+
+
+def discover_oasis_catalogs(search_roots: Optional[Iterable[str]] = None) -> dict:
+    """
+    Merge OASIS catalogs found in common locations (later files override earlier).
+
+    Search order (portable):
+      - $ONT2MD_CATALOG if set (relative paths resolved from cwd)
+      - ./catalog-v001.xml, ./catalog.xml
+      - ./docs/catalog-v001.xml, ./docs/catalog.xml
+      - plus the same under each path in search_roots
+    """
+    merged = {}
+    candidates = []
+    env = os.environ.get("ONT2MD_CATALOG")
+    if env:
+        candidates.append(
+            os.path.normpath(os.path.join(os.getcwd(), env)) if not os.path.isabs(env) else env
+        )
+    base_roots = [os.getcwd(), os.path.join(os.getcwd(), "docs")]
+    if search_roots:
+        base_roots.extend(search_roots)
+    for root in base_roots:
+        for name in ("catalog-v001.xml", "catalog.xml"):
+            candidates.append(os.path.join(root, name))
+
+    seen = set()
+    for path in candidates:
+        if not (os.path.isfile(path) and path.lower().endswith(".xml")):
+            continue
+        ap = os.path.abspath(path)
+        if ap in seen:
+            continue
+        seen.add(ap)
+        merged.update(load_oasis_catalog(ap))
+    return merged
+
+
+def resolve_iri_via_catalog(iri: str, catalog: dict) -> Optional[str]:
+    """
+    Resolve an IRI via catalog.
+
+    Exact matches always apply. Prefix matches apply only when the catalog
+    name is a namespace-style prefix (ends with '/') and the target is a
+    directory (or directory-like URI), so a mapping of a whole ontology IRI
+    onto a single .owl/.ttl file is not accidentally reused for child IRIs.
+    """
+    if not catalog:
+        return None
+
+    def _usable(target: Optional[str]) -> Optional[str]:
+        if not target:
+            return None
+        # Local path that does not exist → treat as unresolved so callers can
+        # fall back to fetching the original IRI (common with machine-specific
+        # Protégé file: catalogs checked out elsewhere).
+        if "://" not in target and not os.path.exists(target):
+            log.debug("Catalog target missing on disk, ignoring: %s", target)
+            return None
+        return target
+
+    if iri in catalog:
+        return _usable(catalog[iri])
+    alt = iri.rstrip("/")
+    if alt in catalog:
+        return _usable(catalog[alt])
+    if (alt + "/") in catalog:
+        return _usable(catalog[alt + "/"])
+
+    best_name = None
+    for name, target in catalog.items():
+        if not name.endswith("/"):
+            continue
+        if not iri.startswith(name):
+            continue
+        is_dir_target = (
+            target.endswith("/")
+            or target.endswith(os.sep)
+            or os.path.isdir(target)
+        )
+        if not is_dir_target:
+            continue
+        if best_name is None or len(name) > len(best_name):
+            best_name = name
+    if best_name is None:
+        return None
+    base = catalog[best_name]
+    remainder = iri[len(best_name) :]
+    if "://" in base:
+        return base.rstrip("/") + "/" + remainder.lstrip("/")
+    if not remainder:
+        return _usable(base)
+    return _usable(os.path.normpath(os.path.join(base, remainder)))
+
+
+def _expand_local_path(path: str, base_dir: Optional[str] = None) -> str:
+    path = os.path.expanduser(path.strip())
+    if not os.path.isabs(path) and base_dir:
+        path = os.path.join(base_dir, path)
+    return os.path.normpath(path)
+
+
+def _entrypoint_in_dir(directory: str, iri: str) -> Optional[str]:
+    """Pick a likely ontology entry file under a mapped local directory."""
+    docs = os.path.join(directory, "docs") if os.path.isdir(os.path.join(directory, "docs")) else directory
+    # Derive a short name from the IRI path (e.g. .../itsdata/vehicle/v1/ → vehicle)
+    parts = [p for p in iri.rstrip("/").split("/") if p and p != "v1" and not re.fullmatch(r"v\d+", p)]
+    leaf = parts[-1] if parts else ""
+    leaf = leaf.replace("part", "") if leaf.startswith("part") and leaf[4:].isdigit() else leaf
+
+    candidates = []
+    if leaf:
+        for name in (f"its-{leaf}.ttl", f"{leaf}.ttl", f"cdm{leaf}.ttl", f"its-{leaf}.owl", f"{leaf}.owl"):
+            candidates.append(os.path.join(docs, name))
+    # Common project entrypoints
+    for name in ("its-core.ttl", "cdm1.ttl", "cdm2.ttl", "cdm3.ttl"):
+        candidates.append(os.path.join(docs, name))
+
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+
+    # Last resort: single non-pattern/non-shacl ttl in docs/
+    if os.path.isdir(docs):
+        ttls = [
+            os.path.join(docs, f)
+            for f in sorted(os.listdir(docs))
+            if f.lower().endswith((".ttl", ".owl", ".rdf"))
+            and "-pattern" not in f.lower()
+            and "-shacl" not in f.lower()
+            and "-reqview" not in f.lower()
+        ]
+        if len(ttls) == 1:
+            return ttls[0]
+    return None
+
+
+def load_dev_iri_map(map_path: str) -> dict:
+    """
+    Load a per-user IRI → local path map used only with ``ttl2md.py --dev``.
+
+    File formats:
+      - YAML object: ``{ "https://.../": "/local/path", ... }``
+      - JSON object with the same shape
+      - Optional wrapper key ``mappings:``
+
+    Paths may use ``~`` and may be relative to the map file's directory.
+    Values may be ontology files or checkout directories (entrypoint is inferred).
+    """
+    import json
+
+    if not map_path or not os.path.isfile(map_path):
+        raise FileNotFoundError(f"Dev IRI map not found: {map_path}")
+
+    raw = open(map_path, "r", encoding="utf-8").read()
+    data = None
+    lower = map_path.lower()
+    if lower.endswith((".yml", ".yaml")):
+        try:
+            import yaml  # type: ignore
+            data = yaml.safe_load(raw)
+        except Exception as e:
+            raise ValueError(f"Could not parse YAML dev map {map_path}: {e}") from e
+    elif lower.endswith(".json"):
+        data = json.loads(raw)
+    else:
+        # Try YAML then JSON
+        try:
+            import yaml  # type: ignore
+            data = yaml.safe_load(raw)
+        except Exception:
+            data = json.loads(raw)
+
+    if not isinstance(data, dict):
+        raise ValueError(f"Dev IRI map must be a mapping object: {map_path}")
+
+    if "mappings" in data and isinstance(data["mappings"], dict):
+        data = data["mappings"]
+
+    base_dir = os.path.dirname(os.path.abspath(map_path))
+    out: dict = {}
+    for name, target in data.items():
+        if not name or target is None:
+            continue
+        if not isinstance(name, str) or not isinstance(target, str):
+            log.warning("Ignoring non-string mapping entry in %s: %r → %r", map_path, name, target)
+            continue
+        path = _expand_local_path(target, base_dir)
+        out[name] = path
+        out[name.rstrip("/")] = path
+        if not name.endswith("/"):
+            out[name + "/"] = path
+    log.info("Loaded %d IRI keys from dev map %s", len({k.rstrip("/") for k in out}), map_path)
+    return out
+
+
+def resolve_iri_via_dev_map(iri: str, dev_map: dict) -> Optional[str]:
+    """Resolve an import IRI through a --dev local map (exact or longest prefix)."""
+    if not dev_map:
+        return None
+
+    def _usable(target: Optional[str], for_iri: str) -> Optional[str]:
+        if not target:
+            return None
+        if os.path.isfile(target):
+            return target
+        if os.path.isdir(target):
+            entry = _entrypoint_in_dir(target, for_iri)
+            if entry:
+                return entry
+            log.warning("Dev map target is a directory with no ontology entry file: %s", target)
+            return None
+        log.debug("Dev map target missing on disk: %s", target)
+        return None
+
+    if iri in dev_map:
+        hit = _usable(dev_map[iri], iri)
+        if hit:
+            return hit
+    alt = iri.rstrip("/")
+    for key in (alt, alt + "/"):
+        if key in dev_map:
+            hit = _usable(dev_map[key], iri)
+            if hit:
+                return hit
+
+    # Longest prefix match (namespace → directory or file)
+    best = None
+    for name in dev_map:
+        if not name.endswith("/"):
+            continue
+        if iri.startswith(name) and (best is None or len(name) > len(best)):
+            best = name
+    if best is None:
+        return None
+    target = dev_map[best]
+    if os.path.isfile(target):
+        return target
+    if os.path.isdir(target):
+        # If prefix maps to a parent of checkouts, remainder may be a relative path
+        remainder = iri[len(best) :].strip("/")
+        if remainder:
+            # try remainder as relative path under target
+            candidate = os.path.normpath(os.path.join(target, remainder))
+            if os.path.isfile(candidate):
+                return candidate
+            if os.path.isdir(candidate):
+                return _entrypoint_in_dir(candidate, iri)
+        return _entrypoint_in_dir(target, iri)
+    return None
+
+
+def resolve_import_iri(
+    iri: str,
+    catalog: Optional[dict] = None,
+    dev_map: Optional[dict] = None,
+) -> str:
+    """
+    Resolve an owl:imports IRI for loading.
+
+    Order: ``--dev`` map (if provided) → OASIS catalog → original IRI (HTTP fetch).
+    The dev map is applied only when the caller passes one (ttl2md ``--dev``).
+    """
+    if dev_map:
+        via_dev = resolve_iri_via_dev_map(iri, dev_map)
+        if via_dev:
+            log.info("Dev map: <%s> → %s", iri, via_dev)
+            return via_dev
+    if catalog:
+        via_cat = resolve_iri_via_catalog(iri, catalog)
+        if via_cat:
+            return via_cat
+    return iri
+
+
+def find_dev_iri_map_path(
+    explicit: Optional[str] = None,
+    search_roots: Optional[Iterable[str]] = None,
+) -> Optional[str]:
+    """
+    Locate a per-user dev IRI map file.
+
+    Search order (first hit wins):
+      1. Explicit ``--dev-map`` path
+      2. Personal map names under: search_roots, cwd, tool install root (ont2md/),
+         and ``~/.config/ont2md/``
+      3. ``dev-iri-map.example.yml`` in those same places (last resort)
+
+    Personal map names: ``dev-iri-map.yml`` / ``.yaml`` / ``.json``,
+    ``.ont2md-dev-map.yml`` / ``.yaml`` / ``.json``.
+    """
+    if explicit:
+        path = os.path.expanduser(explicit)
+        return path if os.path.isfile(path) else None
+
+    personal = (
+        "dev-iri-map.yml",
+        "dev-iri-map.yaml",
+        "dev-iri-map.json",
+        ".ont2md-dev-map.yml",
+        ".ont2md-dev-map.yaml",
+        ".ont2md-dev-map.json",
+    )
+    examples = (
+        "dev-iri-map.example.yml",
+        "dev-iri-map.example.yaml",
+        "dev-iri-map.example.json",
+    )
+
+    tool_python = os.path.dirname(os.path.realpath(__file__))
+    tool_root = os.path.dirname(tool_python)
+    roots: list[str] = []
+    if search_roots:
+        roots.extend(search_roots)
+    roots.extend(
+        [
+            os.getcwd(),
+            tool_root,
+            tool_python,
+            os.path.join(os.path.expanduser("~"), ".config", "ont2md"),
+        ]
+    )
+
+    def _scan(names: tuple[str, ...]) -> Optional[str]:
+        seen = set()
+        for root in roots:
+            if not root:
+                continue
+            for name in names:
+                path = os.path.abspath(os.path.join(root, name))
+                if path in seen:
+                    continue
+                seen.add(path)
+                if os.path.isfile(path):
+                    return path
+        return None
+
+    hit = _scan(personal)
+    if hit:
+        return hit
+    return _scan(examples)
+
+
+def describe_dev_iri_map_search(search_roots: Optional[Iterable[str]] = None) -> list[str]:
+    """Return absolute paths that ``find_dev_iri_map_path`` would consider (for error messages)."""
+    tool_python = os.path.dirname(os.path.realpath(__file__))
+    tool_root = os.path.dirname(tool_python)
+    roots: list[str] = []
+    if search_roots:
+        roots.extend(search_roots)
+    roots.extend(
+        [
+            os.getcwd(),
+            tool_root,
+            os.path.join(os.path.expanduser("~"), ".config", "ont2md"),
+        ]
+    )
+    names = (
+        "dev-iri-map.yml",
+        "dev-iri-map.yaml",
+        "dev-iri-map.json",
+        ".ont2md-dev-map.yml",
+        "dev-iri-map.example.yml",
+    )
+    out = []
+    seen = set()
+    for root in roots:
+        for name in names:
+            path = os.path.abspath(os.path.join(root, name))
+            if path not in seen:
+                seen.add(path)
+                out.append(path)
+    return out
+
+
 def _norm_base(u: str) -> str:
     return u.rstrip('/#')
 
@@ -64,8 +482,11 @@ def resolve_home_ontology(ontology_info: dict, preferred_prefix: str) -> str | N
     return non_reqview[0] if non_reqview else None
 
 def should_skip_nav_ontology(ont_name: str, ont: dict) -> bool:
-    """Skip nav only for ReqView sidecars and empty ontology header shells."""
+    """Skip nav for ReqView sidecars, alignment/SHACL modules, and empty shells."""
     if ont_name.endswith("-reqview"):
+        return True
+    path = (ont.get("file") or "").lower()
+    if path.endswith("-alignment.ttl") or path.endswith("-shacl.ttl"):
         return True
     if ont_name == ont.get("prefix"):
         classes = ont.get("classes") or set()
@@ -722,14 +1143,14 @@ def get_shacl_constraints(g: Graph, cls: URIRef, ns: str, prefix_map: dict) -> d
 
             prop_name = get_qname(path, ns, prefix_map)
 
-            # Collect all shapes that may contribute constraints for this property
-            shapes_to_check = [prop_shape] + list(g.objects(prop_shape, SH.node))
-
             # Gather cardinality and class from all relevant shapes
             min_count = None
             max_count = None
             class_uris = []
             datatype = None
+            unique_lang = False
+            node_refs = list(g.objects(prop_shape, SH.node))
+            shapes_to_check = [prop_shape] + node_refs
 
             for s in shapes_to_check:
                 # Cardinality
@@ -750,6 +1171,23 @@ def get_shacl_constraints(g: Graph, cls: URIRef, ns: str, prefix_map: dict) -> d
                 if dt:
                     datatype = dt
 
+                if g.value(s, SH.uniqueLang) is not None:
+                    unique_lang = True
+
+            # Fallback when reusable multilingual shapes are referenced but not loaded
+            for node_ref in node_refs:
+                if not isinstance(node_ref, URIRef):
+                    continue
+                local = str(node_ref).rsplit("/", 1)[-1].rsplit("#", 1)[-1]
+                if "Multilingual" not in local:
+                    continue
+                unique_lang = True
+                if datatype is None:
+                    datatype = URIRef("http://www.w3.org/1999/02/22-rdf-syntax-ns#langString")
+                if min_count is None and max_count is None:
+                    if local.startswith("ExactlyOne") or local.startswith("MinOne"):
+                        min_count = Literal(1)
+
             # Now build the readable constraint strings
             if datatype:
                 dt_name = get_qname(datatype, ns, prefix_map)
@@ -760,6 +1198,9 @@ def get_shacl_constraints(g: Graph, cls: URIRef, ns: str, prefix_map: dict) -> d
                         constraints[prop_name].append(f"min {min_count} {dt_name}")
                     if max_count is not None:
                         constraints[prop_name].append(f"max {max_count} {dt_name}")
+                elif unique_lang:
+                    # Multilingual shapes without min/max → one value per language
+                    constraints[prop_name].append(f"0..* {dt_name} (one per language)")
                 else:
                     # no cardinality, just datatype
                     constraints[prop_name].append(f"datatype {dt_name}")
@@ -808,22 +1249,59 @@ def get_shacl_diagram_constraints(g: Graph, cls: URIRef, ns: str, prefix_map: di
     """
     constraints = defaultdict(dict)
 
+    def _local_name(uri) -> str:
+        s = str(uri)
+        return s.rsplit("/", 1)[-1].rsplit("#", 1)[-1]
+
+    def _apply_node_ref_conventions(node_uri) -> None:
+        """When CoreSHACL is not loaded, sh:node still names the reusable shape.
+
+        Infer multiplicity / datatype / uniqueLang from the IRI local name
+        (e.g. ExactlyOneShape, MaxOneMultilingualShape).
+        """
+        local = _local_name(node_uri)
+        if not local.endswith("Shape"):
+            return
+
+        # Cardinality from standard reusable shapes
+        if "multiplicity" not in constraints[prop_name]:
+            if local.startswith("ExactlyOne"):
+                # Multilingual "exactly one" means ≥1 with one-per-language
+                constraints[prop_name]["multiplicity"] = (
+                    "1..*" if "Multilingual" in local else "1"
+                )
+            elif local.startswith("MaxOne"):
+                constraints[prop_name]["multiplicity"] = (
+                    "0..*" if "Multilingual" in local else "0..1"
+                )
+            elif local.startswith("MinOne"):
+                constraints[prop_name]["multiplicity"] = "1..*"
+
+        if "Multilingual" in local:
+            constraints[prop_name]["uniqueLang"] = True
+            constraints[prop_name].setdefault("datatype", "rdf:langString")
+
     def _get_multiplicity(shape) -> str | None:
         minc = g.value(shape, SH.minCount)
         maxc = g.value(shape, SH.maxCount)
 
-        if minc is None and maxc is None:
-            return None
+        if minc is not None or maxc is not None:
+            # Normalize to UML-style string
+            if minc is not None and maxc is not None and minc == maxc:
+                if minc == 1:
+                    return "1"          # most common shorthand
+                return f"{minc}"        # exactly N → just "N" or "3"
 
-        # Normalize to UML-style string
-        if minc is not None and maxc is not None and minc == maxc:
-            if minc == 1:
-                return "1"          # most common shorthand
-            return f"{minc}"        # exactly N → just "N" or "3"
+            min_str = str(minc) if minc is not None else "0"
+            max_str = str(maxc) if maxc is not None else "*"
+            return f"{min_str}..{max_str}"
 
-        min_str = str(minc) if minc is not None else "0"
-        max_str = str(maxc) if maxc is not None else "*"
-        return f"{min_str}..{max_str}"
+        # Multilingual reusable shapes use sh:uniqueLang without min/max
+        # (one value per language). Treat as open cardinality for UML.
+        if g.value(shape, SH.uniqueLang) is not None:
+            return "0..*"
+
+        return None
 
     for shape in g.subjects(SH.targetClass, cls):
         for prop_shape in g.objects(shape, SH.property):
@@ -832,8 +1310,10 @@ def get_shacl_diagram_constraints(g: Graph, cls: URIRef, ns: str, prefix_map: di
                 continue
             prop_name = get_qname(path, ns, prefix_map)
 
+            node_refs = list(g.objects(prop_shape, SH.node))
+
             # Direct constraints + sh:node reusable shapes
-            for s in [prop_shape] + list(g.objects(prop_shape, SH.node)):
+            for s in [prop_shape] + node_refs:
                 mult = _get_multiplicity(s)
                 if mult:
                     constraints[prop_name]['multiplicity'] = mult
@@ -847,6 +1327,15 @@ def get_shacl_diagram_constraints(g: Graph, cls: URIRef, ns: str, prefix_map: di
                 sh_datatype = g.value(s, SH.datatype)
                 if sh_datatype:
                     constraints[prop_name]['datatype'] = get_qname(sh_datatype, ns, prefix_map)
+
+                # Multilingual: at most one literal per language tag
+                if g.value(s, SH.uniqueLang) is not None:
+                    constraints[prop_name]['uniqueLang'] = True
+
+            # Fallback when reusable shapes are referenced but not loaded
+            for node_ref in node_refs:
+                if isinstance(node_ref, URIRef):
+                    _apply_node_ref_conventions(node_ref)
 
     return constraints
 

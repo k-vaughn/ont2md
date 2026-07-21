@@ -1,5 +1,14 @@
 site/
 venv/
+.venv/
 python/__pycache__
 concept_registry.md
 ontology_registry.md
+
+# Per-user --dev IRI remaps (keep example committed; each contributor maintains their own)
+dev-iri-map.yml
+dev-iri-map.yaml
+dev-iri-map.json
+.ont2md-dev-map.yml
+.ont2md-dev-map.yaml
+.ont2md-dev-map.json

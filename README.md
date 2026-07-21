@@ -32,11 +32,13 @@ cd /path/to/your-mkdocs-project   # must contain mkdocs.yml and docs/
 python python/ttl2md.py
 ```
 
-Optional flag:
+Optional flags:
 
 | Flag | Meaning |
 |------|---------|
 | `--create-missing` or `-c` | ReqView CSV includes concepts **without** `its-core:reqviewId` (empty `id` column for new ReqView objects). Default: only concepts that already have a ReqView ID. |
+| `--dev` or `-dev` | Remap `owl:imports` through a **local per-user map file** instead of fetching mapped IRIs from the network. |
+| `--dev-map PATH` | Path to that map (implies `--dev`). Default search: `./dev-iri-map.yml` (also `.yaml` / `.json` / `.ont2md-dev-map.*`). |
 
 The use of ReqView for tracing ontology concepts to use cases is entirely optional but has been provided for use within ISO TC 204.
 
@@ -45,6 +47,7 @@ No other command-line arguments are accepted. Extra arguments print usage and ex
 ### Exit behavior
 
 - **Missing `mkdocs.yml` or `docs/`** — error message, exit `1`
+- **`--dev` without a map file** — error message, exit `1`
 - **Invalid Turtle syntax** in a pattern file or optional shared SHACL file — error with line context, exit `2` (no partial site generation)
 - **No `.ttl` files in `docs/`** — message and exit `0`
 - **Per-class or nav/CSV errors** — logged; other outputs may still be written
@@ -97,9 +100,42 @@ On classes, prefer `skos:definition`, `skos:example`, and `skos:note` where appl
 - Without `--create-missing`, rows are emitted only for concepts that already have a ReqView ID.
 - `ITSThing` and `TimeThing` are omitted from the CSV.
 
-### Optional shared SHACL
+### owl:imports
 
-If the file `ontology-its-core/docs/its-sh.ttl` exists at a configured path on the machine running the script, it is parsed when resolving `owl:imports` for pattern modules. Invalid syntax in that file aborts the run (exit `2`).
+After loading every `docs/*.ttl` file, the script recursively follows `owl:imports`:
+
+1. Skip IRIs already present as an `owl:Ontology` from local files
+2. If `--dev` / `--dev-map` was given, remap via the local per-user IRI map
+3. Resolve via an OASIS XML catalog if present (`catalog-v001.xml` / `catalog.xml` in the project root or `docs/`, or `$ONT2MD_CATALOG`)
+4. Otherwise fetch the import IRI over HTTP(S) (with retries) or open a local path
+
+Imported graphs contribute constraints and external types used in diagrams. **Generated class pages stay limited to the project’s master namespace**, so documentation does not spawn pages for every foreign class.
+
+Remote fetches (especially via `w3id.org` redirects) can fail transiently with TLS errors such as `SSL: UNEXPECTED_EOF_WHILE_READING`. The script retries several times; for offline work use `--dev` with a local map.
+
+Catalog entries should use portable relative paths (resolved against the catalog file’s directory), not machine-specific absolute paths.
+
+#### Dev mode (`--dev`) — local IRI map
+
+Normal runs (no `--dev`) always use published IRIs / catalogs. Local remaps are **opt-in only**, so you cannot accidentally stay on checkouts when intending to exercise the live site.
+
+1. Copy `dev-iri-map.example.yml` → `dev-iri-map.yml` next to the tool, or to `~/.config/ont2md/dev-iri-map.yml` (recommended so every ontology project can share one map). The personal file is gitignored.
+2. Point each IRI at a local checkout directory or ontology file.
+3. Run from the ontology project (or the tool checkout):
+
+```bash
+python /path/to/ont2md/python/ttl2md.py --dev
+# or: python python/ttl2md.py --dev-map ~/.config/ont2md/dev-iri-map.yml
+```
+
+Search order for `--dev`: current project → tool install directory → `~/.config/ont2md/` → `dev-iri-map.example.yml` as a last resort (with a note). The script prints a clear `*** DEV MODE ***` banner when remaps are active. Omit `--dev` to fetch live published ontologies again.
+
+Example map entries:
+
+```yaml
+https://w3id.org/itsdata/vehicle/v1/: ~/GitHub/ontology-its-vehicle
+https://w3id.org/citydata/part1/v1/: ~/GitHub/ontology-cdm-p1/docs/cdm1.ttl
+```
 
 ### Concept registry (optional)
 
@@ -117,6 +153,8 @@ From the project root, under `docs/`:
 | `properties/<prefix:local>.md` | One page per local object/datatype property |
 | `diagrams/<ClassName>.dot.svg` (and related `.dot` / `.png`) | ODM-style diagrams (OWL + SHACL merged) |
 | `traceability/<prefix>.csv` | ReqView update export |
+
+Before writing new pages, `docs/classes/`, `docs/properties/`, and `docs/diagrams/` are cleared and recreated so renamed or removed concepts do not leave stale Markdown or diagram files behind. Clearing happens only after Turtle has been parsed successfully.
 
 `mkdocs.yml` **`nav`** is replaced to reflect patterns (or a flat Classes/Properties layout when no `*-pattern.ttl` files exist).
 
