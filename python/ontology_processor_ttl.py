@@ -1,17 +1,131 @@
 # ontology_processor_ttl.py
+import io
 import os
 import logging
 import re
+import ssl
+import time
+import urllib.error
+import urllib.request
 from rdflib import Graph, RDF, OWL, RDFS, URIRef
-from rdflib.namespace import SH
+from rdflib.namespace import SH, VANN
 
 from utils import (
     get_qname,
     discover_oasis_catalogs,
-    resolve_iri_via_catalog,
+    resolve_import_iri,
 )
 
 log = logging.getLogger("ttl2mkdocs")
+
+_RDF_ACCEPT = (
+    "text/turtle, application/rdf+xml, application/owl+xml, "
+    "application/ld+json, text/n3, application/n-triples, */*;q=0.1"
+)
+
+
+def _content_type_to_format(content_type: str | None) -> str | None:
+    if not content_type:
+        return None
+    ct = content_type.split(";", 1)[0].strip().lower()
+    return {
+        "text/turtle": "turtle",
+        "application/x-turtle": "turtle",
+        "application/turtle": "turtle",
+        "application/rdf+xml": "xml",
+        "application/owl+xml": "xml",
+        "application/xml": "xml",
+        "text/xml": "xml",
+        "text/n3": "n3",
+        "application/n-triples": "nt",
+        "application/ld+json": "json-ld",
+    }.get(ct)
+
+
+def _fetch_url_bytes(url: str, retries: int = 4, timeout: float = 45.0) -> tuple[bytes, str | None]:
+    """
+    Download a remote ontology with retries.
+
+    RDFLib's default urlopen is a single attempt; w3id.org redirect chains often
+    fail transiently with SSL UNEXPECTED_EOF_WHILE_READING. Fetching ourselves
+    lets us retry and then parse from memory.
+    """
+    headers = {
+        "User-Agent": "ont2md-ttl2md/1.0 (+https://github.com/; ontology documentation)",
+        "Accept": _RDF_ACCEPT,
+        "Connection": "close",
+    }
+    ctx = ssl.create_default_context()
+    last_err: Exception | None = None
+
+    # w3id and some hosts treat trailing slash as significant; try both if needed
+    candidates = [url]
+    if url.endswith("/"):
+        candidates.append(url.rstrip("/"))
+    else:
+        candidates.append(url + "/")
+
+    for candidate in candidates:
+        for attempt in range(1, retries + 1):
+            try:
+                req = urllib.request.Request(candidate, headers=headers, method="GET")
+                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                    data = resp.read()
+                    ctype = resp.headers.get("Content-Type")
+                    if not data:
+                        raise ValueError(f"Empty response from {candidate}")
+                    log.debug(
+                        "Fetched %s (%d bytes, Content-Type=%s) on attempt %d",
+                        candidate,
+                        len(data),
+                        ctype,
+                        attempt,
+                    )
+                    return data, ctype
+            except (urllib.error.URLError, ssl.SSLError, TimeoutError, ConnectionError, ValueError) as e:
+                last_err = e
+                log.warning(
+                    "Fetch attempt %d/%d failed for %s: %s",
+                    attempt,
+                    retries,
+                    candidate,
+                    e,
+                )
+                if attempt < retries:
+                    time.sleep(min(2.0, 0.4 * attempt))
+        # exhausted retries for this candidate; try alternate slash form
+    raise last_err or urllib.error.URLError(f"Failed to fetch {url}")
+
+
+def _parse_rdf_bytes(g: Graph, data: bytes, content_type: str | None = None, public_id: str | None = None) -> None:
+    """Parse RDF bytes into g using Content-Type hint, then format fallbacks on a temp graph."""
+    source = io.BytesIO(data)
+    hinted = _content_type_to_format(content_type)
+    formats = []
+    if hinted:
+        formats.append(hinted)
+    for fmt in ("xml", "turtle", "n3", "nt", "json-ld"):
+        if fmt not in formats:
+            formats.append(fmt)
+
+    last_err = None
+    for fmt in formats:
+        try:
+            tmp = Graph()
+            tmp.parse(source, format=fmt, publicID=public_id)
+            g += tmp
+            return
+        except Exception as e:
+            last_err = e
+            source.seek(0)
+    # Last resort: let rdflib guess without an explicit format
+    try:
+        source.seek(0)
+        g.parse(source, publicID=public_id)
+        return
+    except Exception as e:
+        last_err = e
+    raise last_err or ValueError("Could not parse RDF bytes")
 
 
 def parse_concept_registry(script_dir):
@@ -83,7 +197,17 @@ def _extract_master_namespace(ttl_files: list) -> str:
 
 
 def _parse_import_source(g: Graph, source: str) -> None:
-    """Parse a local path or URL into g, trying common RDF serializations."""
+    """Parse a local path or URL into g, trying common RDF serializations.
+
+    Remote ontologies are often RDF/XML (e.g. CityData on w3id.org). Trying Turtle
+    first against RDF/XML is unsafe: the Turtle parser can emit many
+    "does not look like a valid URI" warnings (XML start-tag text treated as IRIs)
+    and may leave bad triples in the graph before failing. Prefer auto-detect /
+    Content-Type, and only probe formats on a temporary graph.
+
+    Remote HTTP(S) IRIs are downloaded with retries (w3id redirect/TLS flakes are
+    common), then parsed from memory.
+    """
     if os.path.isfile(source):
         ext = os.path.splitext(source)[1].lower()
         fmt = {
@@ -98,25 +222,186 @@ def _parse_import_source(g: Graph, source: str) -> None:
         }.get(ext)
         if fmt:
             g.parse(source, format=fmt)
-        else:
-            g.parse(source)
+            return
+        # Unknown extension: auto-detect without guessing Turtle first
+        g.parse(source)
         return
 
-    # Remote / opaque IRI: try turtle then generic parse
+    if source.startswith(("http://", "https://")):
+        data, ctype = _fetch_url_bytes(source)
+        _parse_rdf_bytes(g, data, content_type=ctype, public_id=source)
+        return
+
+    # file: URLs or other opaque sources: let rdflib open them
     try:
-        g.parse(source, format="turtle")
-    except Exception:
         g.parse(source)
+        return
+    except Exception:
+        pass
+
+    last_err = None
+    for fmt in ("xml", "turtle", "n3", "nt", "json-ld"):
+        try:
+            tmp = Graph()
+            tmp.parse(source, format=fmt)
+            g += tmp
+            return
+        except Exception as e:
+            last_err = e
+    raise last_err or ValueError(f"Could not parse import source: {source}")
 
 
-def _load_owl_imports(g: Graph, errors: list, catalog: dict | None = None, max_depth: int = 12) -> None:
+def _normalize_namespace_uri(uri: str) -> str:
+    """Normalize a namespace URI to a consistent trailing form for binding."""
+    s = str(uri).strip()
+    if not s:
+        return s
+    if s.endswith(("#", "/")):
+        return s
+    return s + "/"
+
+
+def _namespace_from_vann_and_ontology(vann_uri: str, ont: URIRef) -> str:
+    """
+    Resolve the vocabulary namespace for a preferred prefix.
+
+    Prefer ``vann:preferredNamespaceUri`` when present. If that URI is a parent
+    of a versioned ontology IRI (e.g. vann ``.../core/`` with ontology
+    ``.../core/v1/``), extend it to include the ``vN/`` segment so qnames do
+    not become ``its-core:v1/Code``.
+
+    Do **not** treat pattern/module IRIs (``.../v1/AgreementPattern``) as the
+    namespace — those are individuals in the vocabulary, not the NS itself.
+    """
+    vann = _normalize_namespace_uri(vann_uri) if vann_uri else ""
+    ont_s = str(ont).strip()
+    if not vann:
+        # No vann URI: only accept an ontology IRI that itself looks like a NS.
+        if ont_s.endswith(("/", "#")) and re.search(r"/v\d+/$", ont_s):
+            return ont_s
+        return ""
+
+    if ont_s.startswith(vann):
+        rest = ont_s[len(vann) :]
+        m = re.match(r"(v\d+)/?", rest)
+        if m:
+            return vann + m.group(1) + "/"
+    return vann
+
+
+def _prefer_longer_namespace(a: str, b: str) -> str:
+    """If one namespace URI is a parent of the other, keep the longer (more specific)."""
+    if not a:
+        return b
+    if not b:
+        return a
+    if a == b:
+        return a
+    if b.startswith(a) and len(b) > len(a):
+        return b
+    if a.startswith(b) and len(a) > len(b):
+        return a
+    return a
+
+
+def _rebind_preferred_prefixes(g: Graph, master_ns: str | None = None) -> None:
+    """
+    Restore curated namespace prefixes after owl:imports.
+
+    Imported Turtle modules often bind their vocabulary to the empty prefix
+    (``PREFIX : <.../>``). RDFLib's default bind semantics then *replace* any
+    earlier meaningful prefix (e.g. ``its-time``) for that namespace. Later
+    RDF/XML imports invent ``defaultN`` bindings for the orphaned namespaces.
+
+    Re-apply ``vann:preferredNamespacePrefix`` / ``vann:preferredNamespaceUri``
+    from every loaded Ontology, and restore the master empty prefix.
+    """
+    preferred: dict[str, str] = {}  # prefix -> namespace URI
+    for ont in g.subjects(RDF.type, OWL.Ontology):
+        pref = g.value(ont, VANN.preferredNamespacePrefix)
+        uri = g.value(ont, VANN.preferredNamespaceUri)
+        if not pref:
+            continue
+        prefix = str(pref).strip()
+        if not prefix or re.fullmatch(r"default\d+", prefix):
+            continue
+
+        chosen = _namespace_from_vann_and_ontology(str(uri) if uri else "", ont)
+        if not chosen:
+            continue
+        preferred[prefix] = _prefer_longer_namespace(preferred.get(prefix, ""), chosen)
+
+    # Do not shorten an existing longer *versioned* binding for the same prefix.
+    existing_by_prefix = {p: str(u) for p, u in g.namespaces()}
+    for prefix, uri in list(preferred.items()):
+        cur = existing_by_prefix.get(prefix)
+        if not cur:
+            continue
+        # Only keep existing if it is vann/parent + vN/ (not a pattern path).
+        if cur.startswith(uri) and re.match(re.escape(uri) + r"v\d+/$", cur):
+            preferred[prefix] = cur
+
+    for prefix, uri in sorted(preferred.items(), key=lambda kv: -len(kv[1])):
+        try:
+            g.namespace_manager.bind(prefix, URIRef(uri), override=True, replace=True)
+            log.debug("Rebound preferred prefix %s: → %s", prefix, uri)
+        except Exception as e:
+            log.warning("Could not bind preferred prefix %s: → %s: %s", prefix, uri, e)
+
+    if master_ns:
+        try:
+            g.namespace_manager.bind("", URIRef(master_ns), override=True, replace=True)
+        except Exception as e:
+            log.warning("Could not restore master empty prefix for %s: %s", master_ns, e)
+
+
+def _build_prefix_map(g: Graph, master_ns: str) -> dict:
+    """
+    Build prefix→URI map for qname rendering.
+
+    Prefer real prefixes over RDFLib ``defaultN`` placeholders when both exist.
+    Prefer the longest *versioned* namespace URI for each prefix.
+    """
+    by_prefix: dict[str, str] = {}
+    for prefix, uri in g.namespaces():
+        u = str(uri)
+        if re.fullmatch(r"default\d+", prefix or ""):
+            continue
+        by_prefix[prefix] = _prefer_longer_namespace(by_prefix.get(prefix, ""), u)
+
+    for ont in g.subjects(RDF.type, OWL.Ontology):
+        pref = g.value(ont, VANN.preferredNamespacePrefix)
+        uri = g.value(ont, VANN.preferredNamespaceUri)
+        if not pref:
+            continue
+        prefix = str(pref).strip()
+        if not prefix or re.fullmatch(r"default\d+", prefix):
+            continue
+        chosen = _namespace_from_vann_and_ontology(str(uri) if uri else "", ont)
+        if chosen:
+            # Vann-derived NS is authoritative; do not keep pattern-path bindings.
+            by_prefix[prefix] = chosen
+
+    if "" not in by_prefix:
+        by_prefix[""] = master_ns
+    return by_prefix
+
+
+def _load_owl_imports(
+    g: Graph,
+    errors: list,
+    catalog: dict | None = None,
+    max_depth: int = 12,
+    dev_map: dict | None = None,
+) -> None:
     """
     Recursively materialize owl:imports into g.
 
     Resolution order for each import IRI:
       1. Already loaded (seen this IRI, or an owl:Ontology with that IRI is present)
-      2. OASIS XML catalog mapping (portable local remaps; no product-specific exceptions)
-      3. Fetch / open the IRI itself (HTTP(S) or file URL)
+      2. Per-user ``--dev`` IRI map (only when provided)
+      3. OASIS XML catalog mapping (portable local remaps; no product-specific exceptions)
+      4. Fetch / open the IRI itself (HTTP(S) or file URL)
 
     Failures are logged and recorded in errors so documentation can still proceed.
     Local classes for the MkDocs site remain limited to the project's master namespace.
@@ -142,7 +427,7 @@ def _load_owl_imports(g: Graph, errors: list, catalog: dict | None = None, max_d
                 log.debug("owl:imports <%s> already present in graph", imp_iri)
                 continue
 
-            source = resolve_iri_via_catalog(imp_iri, catalog) or imp_iri
+            source = resolve_import_iri(imp_iri, catalog=catalog, dev_map=dev_map)
             before = len(g)
             try:
                 _parse_import_source(g, source)
@@ -168,7 +453,7 @@ def _load_owl_imports(g: Graph, errors: list, catalog: dict | None = None, max_d
         pending = nxt
 
 
-def process_ttl_files(ttl_files: list, errors: list) -> tuple:
+def process_ttl_files(ttl_files: list, errors: list, dev_map: dict | None = None) -> tuple:
     """
     Load ALL .ttl files into ONE unified graph, then follow owl:imports.
     Uses the TRUE master base namespace (from BASE) so local_classes works correctly.
@@ -188,14 +473,13 @@ def process_ttl_files(ttl_files: list, errors: list) -> tuple:
         raise ValueError("No triples loaded from any TTL file")
 
     catalog = discover_oasis_catalogs(search_roots=[os.path.dirname(p) for p in ttl_files])
-    _load_owl_imports(g, errors, catalog=catalog)
+    _load_owl_imports(g, errors, catalog=catalog, dev_map=dev_map)
 
     ns = _extract_master_namespace(ttl_files)
     log.info(f"Using master base namespace: {ns}")
 
-    prefix_map = dict(g.namespaces())
-    if ns not in prefix_map:
-        prefix_map[ns] = ":"
+    _rebind_preferred_prefixes(g, master_ns=ns)
+    prefix_map = _build_prefix_map(g, ns)
 
     script_dir = os.path.dirname(os.path.realpath(__file__))
     registry = parse_concept_registry(script_dir)

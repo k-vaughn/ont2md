@@ -1,0 +1,22 @@
+# Per-user local remaps for `python python/ttl2md.py --dev`
+#
+# Copy this file to `dev-iri-map.yml` (gitignored) and edit paths for your machine.
+# Without --dev, ttl2md fetches published IRIs (w3id.org) as usual.
+#
+# Values may be:
+#   - an ontology file (.ttl / .owl / .rdf), or
+#   - a checkout directory (docs/its-….ttl entrypoint is inferred)
+
+https://w3id.org/citydata/part1/v1/: ~/GitHub/ontology-cdm-p1
+https://w3id.org/citydata/part2/v1/: ~/GitHub/ontology-cdm-p2
+https://w3id.org/citydata/part3/v1/: ~/GitHub/ontology-cdm-p3
+https://w3id.org/itsdata/agent/v1/: ~/GitHub/ontology-its-agent-v1
+https://w3id.org/itsdata/core/v1/: ~/GitHub/ontology-its-core
+https://w3id.org/itsdata/location/v1/: ~/GitHub/ontology-its-location
+https://w3id.org/itsdata/regulation/v1/: ~/GitHub/ontology-its-regulation
+https://w3id.org/itsdata/time/v1/: ~/GitHub/ontology-its-time
+https://w3id.org/itsdata/transport-network/v1/: ~/GitHub/ontology-its-transport-network
+https://w3id.org/itsdata/vehicle/v1/: ~/GitHub/ontology-its-vehicle
+
+# Or map directly to a file:
+# https://w3id.org/itsdata/vehicle/v1/: /absolute/path/to/its-vehicle.ttl

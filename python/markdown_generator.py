@@ -36,9 +36,16 @@ yaml.SafeLoader.add_constructor('tag:yaml.org,2002:python/name:pymdownx.superfen
 yaml.SafeLoader.add_constructor('tag:yaml.org,2002:python/name:material.extensions.emoji.to_svg', SafeMkDocsLoader.ignore_python_name)
 
 def get_specializations(g: Graph, cls: URIRef, global_all_classes: set, ns: str, prefix_map: dict, ns_to_ontology: dict) -> list:
-    """Find all subclasses (direct and indirect) of the given class."""
+    """Find all subclasses (direct and indirect) of the given class.
+
+    Each entry is (cls_name, desc, ont, uri, is_alignment).
+    is_alignment is True when the subclass IRI is outside this ontology's
+    master namespace (typical for alignment modules such as
+    ConditionVehicleAlignment).
+    """
     specializations = []
     visited = set()
+
     def collect_subclasses(c):
         if c in visited:
             return
@@ -48,7 +55,8 @@ def get_specializations(g: Graph, cls: URIRef, global_all_classes: set, ns: str,
                 cls_name = get_first_literal(g, s, [RDFS.label]) or str(s).split('/')[-1].split('#')[-1]
                 ont = get_ontology_for_uri(str(s), ns_to_ontology)
                 desc = get_definition(g, s)
-                specializations.append((cls_name, desc, ont, s))
+                is_alignment = not str(s).startswith(ns)
+                specializations.append((cls_name, desc, ont, s, is_alignment))
                 collect_subclasses(s)
     collect_subclasses(cls)
     log.debug(f"Specializations for {cls}: {specializations}")
@@ -107,6 +115,9 @@ def generate_markdown(g: Graph, cls: URIRef, cls_name: str, global_all_classes: 
             svg_lines = f.readlines()
         # Skip first two lines (DOCTYPE and possible comment)
         svg_content = "".join(svg_lines[3:])
+        # Markdown would treat "*" inside inlined SVG as emphasis and corrupt
+        # labels like "[0..*]" — escape before embedding.
+        svg_content = svg_content.replace("*", "&#42;")
         # Indent for tab
         indented_svg = "\n    ".join(svg_content.splitlines()) + "\n"
     except Exception as e:
@@ -132,20 +143,24 @@ def generate_markdown(g: Graph, cls: URIRef, cls_name: str, global_all_classes: 
     specializations = get_specializations(g, cls, global_all_classes, ns, prefix_map, ns_to_ontology)
     specializations_md = ""
     if specializations:
+        has_alignment = any(is_alignment for *_, is_alignment in specializations)
         specializations_md += f"## Specializations of {cls_name}\n\n"
         specializations_md += "| Class | Description |\n"
         specializations_md += "|-------|-------------|\n"
-        for spec_cls, spec_desc, spec_ont, spec_uri in specializations:
-            qname = get_qname(spec_uri, ns, prefix_map)
+        for spec_cls, spec_desc, spec_ont, spec_uri, is_alignment in specializations:
             display_spec = insert_spaces(spec_cls)
-#            if len(class_to_onts[spec_cls]) > 1:
-#                display_spec += f" ({spec_ont})"
-#            elif ':' in qname:
-#                prefix = qname.split(':')[0]
-#                display_spec += f" ({prefix})"
             link = get_url(spec_uri, ns, prefix_map, global_all_classes)
-            specializations_md += f"| [{display_spec}]({link}) | {spec_desc} |\n"
+            class_cell = f"[{display_spec}]({link})"
+            if is_alignment:
+                class_cell += "[^alignment]"
+            specializations_md += f"| {class_cell} | {spec_desc} |\n"
         specializations_md += "\n"
+        if has_alignment:
+            specializations_md += (
+                "[^alignment]: Specialization asserted by this ontology via alignment; "
+                "the class is defined in an external ontology and is not declared as a "
+                "specialization of this class there.\n\n"
+            )
     else:
         log.debug(f"No specializations found for {cls_name}")
     
