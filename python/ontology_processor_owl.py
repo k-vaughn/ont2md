@@ -4,7 +4,7 @@ import logging
 import traceback
 import re
 from rdflib import Graph, RDF, OWL, URIRef, Literal, XSD, RDFS
-from utils import get_qname, get_ontology_metadata, _norm_base, get_leaf_classes, collect_oneOf, collect_list, update_concept_registry, parse_ontology_registry, update_ontology_registry
+from utils import get_qname, get_ontology_metadata, _norm_base, get_leaf_classes, collect_oneOf, collect_list, update_concept_registry, parse_ontology_registry, update_ontology_registry, ritso_repo_from_iri
 from rdflib.namespace import DC, DCTERMS, SKOS, SH
 
 log = logging.getLogger("owl2mkdocs")
@@ -362,9 +362,13 @@ def process_ontology(owl_path: str, errors: list, ontology_info) -> tuple:
     official_iri = ns
     if official_iri not in ontology_registry:
         preferred_prefix = ontology_info["ontology_name"]
-        ritso_location = os.path.basename(os.path.dirname(os.path.dirname(owl_path)))
+        ritso_location = ritso_repo_from_iri(official_iri) or os.path.basename(os.path.dirname(os.path.dirname(owl_path)))
         description = ontology_info["description"]
         ontology_registry[official_iri] = {'preferred_prefix': preferred_prefix, 'ritso_location': ritso_location, 'description': description}
+    else:
+        derived = ritso_repo_from_iri(official_iri)
+        if derived:
+            ontology_registry[official_iri]['ritso_location'] = derived
     update_ontology_registry(script_dir, ontology_registry)
     ontology_info["patterns"] = set()
     ontology_info["non_pattern_classes"] = set()

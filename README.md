@@ -9,7 +9,7 @@ The main entry point for Turtle sources is `python/ttl2md.py`. Related scripts (
 Run the script from the **project root** (the directory that contains `mkdocs.yml` and `docs/`).
 
 | Requirement | Purpose |
-|-------------|---------|
+| ----------- | ------- |
 | `mkdocs.yml` | Site configuration; navigation is rewritten on each run. A sample mkdocs.yml file can be found in any of the ISO-TC204/ontology repositories |
 | `docs/` | Source `.ttl` files and generated Markdown output |
 | Python 3 | Runtime |
@@ -35,7 +35,7 @@ python python/ttl2md.py
 Optional flags:
 
 | Flag | Meaning |
-|------|---------|
+| ---- | ------- |
 | `--create-missing` or `-c` | ReqView CSV includes concepts **without** `its-core:reqviewId` (empty `id` column for new ReqView objects). Default: only concepts that already have a ReqView ID. |
 | `--dev` or `-dev` | Remap `owl:imports` through a **local per-user map file** instead of fetching mapped IRIs from the network. |
 | `--dev-map PATH` | Path to that map (implies `--dev`). Default search: `./dev-iri-map.yml` (also `.yaml` / `.json` / `.ont2md-dev-map.*`). |
@@ -73,7 +73,8 @@ The script determines the **master namespace** from, in order:
 
 1. A `BASE <...>` declaration in any loaded file
 2. `vann:preferredNamespaceUri` on an `owl:Ontology`
-3. Fallback: `https://w3id.org/itsdata/time/v1/`
+3. The empty prefix (`@prefix : <...>` / `PREFIX : <...>`)
+4. Fallback: `https://example.org/`
 
 Only classes and properties whose IRIs start with that namespace are documented as local pages. Imported concepts appear in diagrams and links but do not get their own generated pages unless they are in the unified graph under that namespace.
 
@@ -137,9 +138,18 @@ https://w3id.org/itsdata/vehicle/v1/: ~/GitHub/ontology-its-vehicle
 https://w3id.org/citydata/part1/v1/: ~/GitHub/ontology-cdm-p1/docs/cdm1.ttl
 ```
 
-### Concept registry (optional)
+### Concept and ontology registries
 
-`python/concept_registry.md` can declare extra local properties not fully typed in TTL. The processor may add them to the graph when their URIs fall under the master namespace.
+On each successful TTL load, `ttl2md.py` updates markdown registries next to the script:
+
+| File | Contents |
+|------|----------|
+| `python/concept_registry.md` | Classes and properties seen in the unified graph (local + imported) |
+| `python/ontology_registry.md` | `owl:Ontology` IRIs sorted by Official IRI; Prefix links to `https://isotc204.org/<repo>` (e.g. `ontology-its-core-v1`, `ontology-cdm-p1`) |
+
+New entries are appended; existing IRI keys are left unchanged. Both filenames are listed in `.gitignore` (local tooling artifacts). The OWL/OFN processors already wrote these files; the TTL path now does as well.
+
+### Concept registry (manual extras)
 
 ## What the script generates
 
@@ -157,6 +167,31 @@ From the project root, under `docs/`:
 Before writing new pages, `docs/classes/`, `docs/properties/`, and `docs/diagrams/` are cleared and recreated so renamed or removed concepts do not leave stale Markdown or diagram files behind. Clearing happens only after Turtle has been parsed successfully.
 
 `mkdocs.yml` **`nav`** is replaced to reflect patterns (or a flat Classes/Properties layout when no `*-pattern.ttl` files exist).
+
+### Optional top-level navigation (`top-nav.yml`)
+
+If the project root (next to `mkdocs.yml`) contains **`top-nav.yml`** (or `top-nav.yaml`), those entries are prepended as top-level nav links, and the generated Home / Classes / Properties / pattern sections are nested under a section named after `site_name` (falling back to the project directory name).
+
+Example (`top-nav.example.yml` in this repo):
+
+```yaml
+- TC204 on ISO.org: https://www.iso.org/committee/54706.html
+- TC 204 Home: https://isotc204.org/
+```
+
+That yields navigation like:
+
+```yaml
+nav:
+- TC204 on ISO.org: https://www.iso.org/committee/54706.html
+- TC 204 Home: https://isotc204.org/
+- ITS Ontology - Core:    # from site_name
+  - Home: index.md
+  - Classes: ...
+  - Properties: ...
+```
+
+If the file is absent, navigation is unchanged from the previous flat layout.
 
 ## Typical workflow
 

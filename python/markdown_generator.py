@@ -4,18 +4,81 @@ import logging
 import yaml
 import traceback
 from collections import defaultdict
-from rdflib import Graph, URIRef, OWL, RDFS, RDF
+from rdflib import Graph, URIRef, OWL, RDFS, RDF, Namespace
 from rdflib.namespace import DCTERMS, SKOS, SH
 from utils import (
     get_preferred_prefix, get_qname, get_first_literal, get_shacl_name, insert_spaces, class_restrictions,
     iter_annotations, DESC_PROPS, get_definition,
     get_ontology_for_uri, hyperlink_concept, get_url, get_shacl_constraints, get_pattern_name,
     resolve_home_ontology, should_skip_nav_ontology, get_source_ttl_basename, is_pattern_ttl_file,
-    get_pattern_modules, get_nav_modules,
+    get_pattern_modules, get_nav_modules, get_hyperlinked_class_expression,
 )
 from diagram_generator import generate_diagram, get_id
 
 log = logging.getLogger("ttl2mkdocs")
+
+SCHEMA = Namespace("http://schema.org/")
+
+# Optional project-root file listing external / shared top-level nav links.
+_TOP_NAV_FILENAMES = ("top-nav.yml", "top-nav.yaml")
+
+
+def _load_top_nav(project_root: str) -> list | None:
+    """
+    Load optional top-level nav entries from ``top-nav.yml`` (or ``.yaml``).
+
+    Expected MkDocs-style list of single-key mappings, for example::
+
+        - TC204 on ISO.org: https://www.iso.org/committee/54706.html
+        - TC 204 Home: https://isotc204.org/
+
+    A plain mapping is also accepted and converted to a list. Returns ``None``
+    when the file is absent so callers keep the default (flat) nav.
+    """
+    for name in _TOP_NAV_FILENAMES:
+        path = os.path.join(project_root, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+        except Exception as e:
+            log.warning("Could not read %s: %s", path, e)
+            return None
+        if data is None:
+            log.info("Ignoring empty top-nav file %s", path)
+            return None
+        if isinstance(data, dict):
+            items = [{str(k): v} for k, v in data.items()]
+        elif isinstance(data, list):
+            items = []
+            for entry in data:
+                if isinstance(entry, dict) and entry:
+                    items.append(entry)
+                elif isinstance(entry, str) and ":" in entry:
+                    # Allow "- Label: https://..." parsed poorly as a bare string
+                    label, _, url = entry.partition(":")
+                    items.append({label.strip(): url.strip()})
+                else:
+                    log.warning("Skipping unrecognized top-nav entry in %s: %r", path, entry)
+        else:
+            log.warning("top-nav file %s must be a YAML list or mapping; ignoring", path)
+            return None
+        if not items:
+            log.info("No usable entries in %s; leaving nav unchanged", path)
+            return None
+        log.info("Loaded %d top-level nav link(s) from %s", len(items), path)
+        return items
+    return None
+
+
+def _repo_nav_label(config: dict, project_root: str) -> str:
+    """Label for the nested section that holds this repository's generated pages."""
+    site_name = (config.get("site_name") or "").strip()
+    if site_name:
+        return site_name
+    return os.path.basename(os.path.abspath(project_root)) or "Home"
+
 
 def _pattern_page_relpath(ont_name: str, ontology_info: dict) -> str:
     """
@@ -302,7 +365,7 @@ def update_mkdocs_nav(mkdocs_path: str,
         log.error(error_msg)
         raise
 
-    new_nav = [{"Home": "index.md"}]
+    content_nav = [{"Home": "index.md"}]
     pattern_modules = get_pattern_modules(ontology_info)
 
     if not pattern_modules:
@@ -317,9 +380,9 @@ def update_mkdocs_nav(mkdocs_path: str,
             for prop_qname in sorted(ontology_info.get(ont_name, {}).get("properties", []) or [], key=str.lower):
                 prop_items.append({prop_qname: f"properties/{prop_qname}.md"})
         if class_items:
-            new_nav.append({"Classes": class_items})
+            content_nav.append({"Classes": class_items})
         if prop_items:
-            new_nav.append({"Properties": prop_items})
+            content_nav.append({"Properties": prop_items})
     else:
         for ont_name in get_nav_modules(ontology_info):
             direct_classes = get_direct_classes_for_ontology(ont_name, ontology_info, class_to_onts)
@@ -340,7 +403,16 @@ def update_mkdocs_nav(mkdocs_path: str,
             if prop_items:
                 ont_nav.append({"Properties": prop_items})
 
-            new_nav.append({display_ont: ont_nav})
+            content_nav.append({display_ont: ont_nav})
+
+    project_root = os.path.dirname(os.path.abspath(mkdocs_path))
+    top_nav = _load_top_nav(project_root)
+    if top_nav:
+        # Shared org links first, then this repository's generated pages nested under site_name
+        repo_label = _repo_nav_label(config, project_root)
+        new_nav = list(top_nav) + [{repo_label: content_nav}]
+    else:
+        new_nav = content_nav
 
     config["nav"] = new_nav
 
@@ -501,7 +573,7 @@ def generate_pattern_markdown_file(g: Graph, ont_name: str, ns: str, prefix_map:
         if ontology_info[ont_name].get("draft"):
             f.write("![Draft for review only](https://isotc204.org/assets/img/draft_for_review.svg)\n\n")
         f.write(content)
-    log.info("Generated pattern Markdown at %s", filename)
+    log.debug("Generated pattern Markdown at %s", filename)
 
 def generate_property_markdown(g: Graph, prop_uri: URIRef, prop_name: str, 
                                ns: str, prefix_map: dict, docs_dir: str, 
@@ -515,14 +587,22 @@ def generate_property_markdown(g: Graph, prop_uri: URIRef, prop_name: str,
     title = f"# {prop_name}\n\n"
     desc = get_definition(g, prop_uri)
 
-    # Domain & Range
+    # Domain & Range (rdfs:* plus schema:*Includes for multi-valued fillers)
     domain = []
-    for d in g.objects(prop_uri, RDFS.domain):
-        domain.append(hyperlink_concept(d, ns, prefix_map, global_all_classes, current_doc_dir="properties"))
+    for d in list(g.objects(prop_uri, RDFS.domain)) + list(g.objects(prop_uri, SCHEMA.domainIncludes)):
+        domain.append(
+            get_hyperlinked_class_expression(
+                g, d, ns, prefix_map, global_all_classes, current_doc_dir="properties"
+            )
+        )
     range_ = []
-    for r in g.objects(prop_uri, RDFS.range):
-        range_.append(hyperlink_concept(r, ns, prefix_map, global_all_classes, current_doc_dir="properties"))
-        log.info(f"Range for {prop_name} with {ns} and {r} : {range_}")
+    for r in list(g.objects(prop_uri, RDFS.range)) + list(g.objects(prop_uri, SCHEMA.rangeIncludes)):
+        range_.append(
+            get_hyperlinked_class_expression(
+                g, r, ns, prefix_map, global_all_classes, current_doc_dir="properties"
+            )
+        )
+        log.debug(f"Range for {prop_name} with {ns} and {r} : {range_}")
 
     # SHACL usage
     used_in = []
@@ -554,4 +634,4 @@ def generate_property_markdown(g: Graph, prop_uri: URIRef, prop_name: str,
             f.write("![Draft for review only](https://isotc204.org/assets/img/draft_for_review.svg)\n\n")
         f.write(content)
 
-    log.info(f"Generated property page: {prop_name}.md")
+    log.debug(f"Generated property page: {prop_name}.md")

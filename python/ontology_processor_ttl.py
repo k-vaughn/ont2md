@@ -7,13 +7,19 @@ import ssl
 import time
 import urllib.error
 import urllib.request
-from rdflib import Graph, RDF, OWL, RDFS, URIRef
-from rdflib.namespace import SH, VANN
+from rdflib import Graph, RDF, OWL, RDFS, URIRef, Literal
+from rdflib.namespace import SH, VANN, DCTERMS, SKOS, DC
 
 from utils import (
     get_qname,
+    get_first_literal,
     discover_oasis_catalogs,
     resolve_import_iri,
+    parse_concept_registry,
+    update_concept_registry,
+    parse_ontology_registry,
+    update_ontology_registry,
+    ritso_repo_from_iri,
 )
 
 log = logging.getLogger("ttl2mkdocs")
@@ -128,72 +134,167 @@ def _parse_rdf_bytes(g: Graph, data: bytes, content_type: str | None = None, pub
     raise last_err or ValueError("Could not parse RDF bytes")
 
 
-def parse_concept_registry(script_dir):
-    """Same as before – kept for consistency."""
-    registry_path = os.path.join(script_dir, "concept_registry.md")
-    if not os.path.exists(registry_path):
-        with open(registry_path, "w", encoding="utf-8") as f:
-            f.write(
-                "| base_uri | name | type | description |\n"
-                "|----------|------|------|-------------|\n"
-            )
-        log.info(f"Created new concept_registry.md in {script_dir}")
-        return {}
-    content = open(registry_path, "r", encoding="utf-8").read()
-    lines = content.splitlines()
-    registry = {}
-    in_table = False
-    headers = None
-    for line in lines:
-        if line.strip().startswith("|"):
-            if not in_table:
-                headers = [h.strip().lower() for h in line.split("|") if h.strip()]
-                in_table = True
-            elif headers and not line.strip().startswith("|---"):
-                values = [v.strip() for v in line.split("|") if v.strip()]
-                if len(values) < 3:
-                    continue
-                try:
-                    base_uri = values[headers.index("base_uri")]
-                    name = values[headers.index("name")]
-                    concept_type = values[headers.index("type")]
-                    description = (
-                        values[headers.index("description")]
-                        if "description" in headers and len(values) > headers.index("description")
-                        else ""
-                    )
-                    uri = f"{base_uri}{name}"
-                    registry[uri] = {"type": concept_type, "description": description}
-                except Exception:
-                    pass
-    log.debug(f"Loaded {len(registry)} entries from concept_registry.md")
-    return registry
+def _concept_description(g: Graph, uri: URIRef) -> str:
+    text = get_first_literal(g, uri, [SKOS.definition, DCTERMS.description, DC.description, RDFS.comment])
+    return text or "-"
+
+
+def _ritso_location_from_paths(ttl_files: list) -> str:
+    """Infer checkout folder name (e.g. ontology-its-time) from a docs/*.ttl path."""
+    for path in ttl_files:
+        # .../ontology-its-time/docs/foo.ttl → ontology-its-time
+        parent = os.path.dirname(os.path.abspath(path))
+        if os.path.basename(parent).lower() == "docs":
+            return os.path.basename(os.path.dirname(parent))
+        return os.path.basename(parent)
+    return os.path.basename(os.getcwd()) or "-"
+
+
+def _update_registries_from_graph(g: Graph, ns: str, ttl_files: list, script_dir: str) -> None:
+    """Append newly seen concepts/ontologies to the markdown registries (TTL path)."""
+    registry = parse_concept_registry(script_dir)
+    ontology_registry = parse_ontology_registry(script_dir)
+    fallback_location = _ritso_location_from_paths(ttl_files)
+
+    new_concepts = {}
+    for cls in g.subjects(RDF.type, OWL.Class):
+        if not isinstance(cls, URIRef) or cls == OWL.Thing:
+            continue
+        uri = str(cls)
+        if uri not in registry and uri not in new_concepts:
+            new_concepts[uri] = {"type": "class", "description": _concept_description(g, cls)}
+
+    for prop in g.subjects(RDF.type, OWL.ObjectProperty):
+        if not isinstance(prop, URIRef):
+            continue
+        uri = str(prop)
+        if uri not in registry and uri not in new_concepts:
+            new_concepts[uri] = {
+                "type": "object_property",
+                "description": _concept_description(g, prop),
+            }
+
+    for prop in g.subjects(RDF.type, OWL.DatatypeProperty):
+        if not isinstance(prop, URIRef):
+            continue
+        uri = str(prop)
+        if uri not in registry and uri not in new_concepts:
+            new_concepts[uri] = {
+                "type": "datatype_property",
+                "description": _concept_description(g, prop),
+            }
+
+    for uri, info in new_concepts.items():
+        registry[uri] = info
+    if new_concepts:
+        log.info("Registering %d new concepts in concept_registry.md", len(new_concepts))
+    update_concept_registry(script_dir, registry)
+
+    for ont in g.subjects(RDF.type, OWL.Ontology):
+        if not isinstance(ont, URIRef):
+            continue
+        official_iri = str(ont)
+        # Skip blank-ish / non-http ontology IRIs
+        if not official_iri.startswith("http"):
+            continue
+        ritso_location = ritso_repo_from_iri(official_iri) or fallback_location
+        preferred_prefix = None
+        for pref in g.objects(ont, VANN.preferredNamespacePrefix):
+            preferred_prefix = str(pref).strip()
+            break
+        if not preferred_prefix:
+            preferred_prefix = official_iri.rstrip("/#").split("/")[-1].split("#")[-1] or "ontology"
+        description = (
+            get_first_literal(g, ont, [SKOS.definition, DCTERMS.description, DC.description, RDFS.comment])
+            or "-"
+        )
+        if official_iri in ontology_registry:
+            # Refresh repo link derivation; keep existing prefix/description unless empty
+            existing = ontology_registry[official_iri]
+            if ritso_repo_from_iri(official_iri):
+                existing["ritso_location"] = ritso_location
+            if not existing.get("preferred_prefix"):
+                existing["preferred_prefix"] = preferred_prefix
+            if not existing.get("description") or existing.get("description") in ("-", ""):
+                existing["description"] = description
+            continue
+        ontology_registry[official_iri] = {
+            "preferred_prefix": preferred_prefix,
+            "ritso_location": ritso_location,
+            "description": description,
+        }
+        log.info(
+            "Registering ontology <%s> (prefix=%s, repo=%s)",
+            official_iri,
+            preferred_prefix,
+            ritso_location,
+        )
+
+    # Re-derive repo names for all entries (fixes prior wrong checkout-based locations)
+    for iri, info in ontology_registry.items():
+        derived = ritso_repo_from_iri(iri)
+        if derived:
+            info["ritso_location"] = derived
+
+    update_ontology_registry(script_dir, ontology_registry)
+
+
+def _normalize_master_namespace(uri: str) -> str:
+    """Normalize a namespace URI to a trailing-slash form used as the master NS."""
+    return uri.rstrip("#/") + "/"
 
 
 def _extract_master_namespace(ttl_files: list) -> str:
-    """Find the true master base namespace from BASE declaration or vann:preferredNamespaceUri."""
+    """
+    Find the master base namespace, in priority order:
+
+      1. ``BASE <...>``
+      2. ``vann:preferredNamespaceUri`` (IRI or string literal)
+      3. Empty prefix ``PREFIX : <...>`` / ``@prefix : <...>``
+      4. Fallback ``https://example.org/``
+    """
+    contents: list[tuple[str, str]] = []
     for ttl_path in ttl_files:
         try:
             with open(ttl_path, "r", encoding="utf-8") as f:
-                content = f.read()
-
-            base_match = re.search(r"BASE\s+<([^>]+)>", content, re.IGNORECASE)
-            if base_match:
-                ns = base_match.group(1).rstrip("#/") + "/"
-                log.debug(f"Found master namespace from BASE: {ns}")
-                return ns
-
-            pref_match = re.search(r"vann:preferredNamespaceUri\s+<([^>]+)>", content)
-            if pref_match:
-                ns = pref_match.group(1).rstrip("#/") + "/"
-                log.info(f"Found master namespace from vann:preferredNamespaceUri: {ns}")
-                return ns
-
+                contents.append((ttl_path, f.read()))
         except Exception as e:
             log.warning(f"Could not read {ttl_path} for namespace: {e}")
 
-    log.warning("No BASE or vann:preferredNamespaceUri found – using default")
-    return "https://w3id.org/itsdata/time/v1/"
+    for ttl_path, content in contents:
+        base_match = re.search(r"BASE\s+<([^>]+)>", content, re.IGNORECASE)
+        if base_match:
+            ns = _normalize_master_namespace(base_match.group(1))
+            log.debug(f"Found master namespace from BASE in {ttl_path}: {ns}")
+            return ns
+
+    for ttl_path, content in contents:
+        pref_match = re.search(
+            r"vann:preferredNamespaceUri\s+(?:<([^>]+)>|\"([^\"]+)\"|'([^']+)')",
+            content,
+        )
+        if pref_match:
+            ns = _normalize_master_namespace(
+                pref_match.group(1) or pref_match.group(2) or pref_match.group(3)
+            )
+            log.info(f"Found master namespace from vann:preferredNamespaceUri in {ttl_path}: {ns}")
+            return ns
+
+    for ttl_path, content in contents:
+        empty_match = re.search(
+            r"(?:@prefix|PREFIX)\s*:\s*<([^>]+)>",
+            content,
+            re.IGNORECASE,
+        )
+        if empty_match:
+            ns = _normalize_master_namespace(empty_match.group(1))
+            log.info(f"Found master namespace from empty prefix ':' in {ttl_path}: {ns}")
+            return ns
+
+    log.warning(
+        "No BASE, vann:preferredNamespaceUri, or empty prefix ':' found – using https://example.org/"
+    )
+    return "https://example.org/"
 
 
 def _parse_import_source(g: Graph, source: str) -> None:
@@ -555,5 +656,7 @@ def process_ttl_files(ttl_files: list, errors: list, dev_map: dict | None = None
             u = URIRef(uri)
             qn = get_qname(u, ns, prefix_map)
             prop_map[qn] = u
+
+    _update_registries_from_graph(g, ns, ttl_files, script_dir)
 
     return g, ns, prefix_map, classes, local_classes, prop_map
