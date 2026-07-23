@@ -323,7 +323,7 @@ def resolve_import_iri(
     if dev_map:
         via_dev = resolve_iri_via_dev_map(iri, dev_map)
         if via_dev:
-            log.info("Dev map: <%s> → %s", iri, via_dev)
+            log.debug("Dev map: <%s> → %s", iri, via_dev)
             return via_dev
     if catalog:
         via_cat = resolve_iri_via_catalog(iri, catalog)
@@ -436,17 +436,49 @@ def _norm_base(u: str) -> str:
     return u.rstrip('/#')
 
 def get_pattern_name(ont_name: str) -> str:
-    # Turtle pattern filenames stay lowercase/hyphenated on disk (e.g., area-pattern.ttl),
-    # but the *generated pattern page* is controlled separately via ontology_info.module_name.
+    # Turtle pattern filenames may be kebab-case (*-pattern.ttl) or UpperCamelCase
+    # (*Pattern.ttl). The generated pattern page uses ontology_info.module_name.
     return f"{ont_name}-pattern"
 
 def get_shacl_name(ont_name: str) -> str:
-    return f"{ont_name}-shacl"
+    """Return the SHACL companion basename (no .ttl) for a pattern module key."""
+    if ont_name.endswith("Pattern"):
+        return ont_name[: -len("Pattern")] + "SHACL"
+    # kebab-case / all-lowercase modules → *-shacl
+    if "-" in ont_name or ont_name == ont_name.lower():
+        return f"{ont_name}-shacl"
+    return f"{ont_name}SHACL"
 
 def is_pattern_ttl_file(ont: dict) -> bool:
-    """True when the ontology module is loaded from a *-pattern.ttl file."""
+    """True when the ontology module is loaded from a pattern TTL file."""
     path = ont.get("file") or ""
-    return os.path.basename(path).lower().endswith("-pattern.ttl")
+    base = os.path.basename(path)
+    lower = base.lower()
+    if lower.endswith("-pattern.ttl"):
+        return True
+    # UpperCamelCase: ActivityPattern.ttl (not *SHACL.ttl)
+    return base.endswith("Pattern.ttl")
+
+def is_shacl_or_alignment_ttl(path_or_basename: str) -> bool:
+    """True for SHACL / alignment companion TTL files (kebab or UpperCamelCase)."""
+    base = os.path.basename(path_or_basename or "")
+    lower = base.lower()
+    if lower.endswith("-shacl.ttl") or lower.endswith("-alignment.ttl"):
+        return True
+    return base.endswith("SHACL.ttl") or base.endswith("Alignment.ttl")
+
+def pattern_module_key(basename: str) -> str:
+    """
+    Derive the ontology_info key from a TTL basename (no extension).
+
+    Examples: activity-pattern → activity, ActivityPattern → Activity, 5087-1 → 5087-1
+    """
+    if basename.endswith("Pattern"):
+        stripped = basename[: -len("Pattern")]
+        return stripped or basename
+    if basename.endswith("-pattern"):
+        return basename[: -len("-pattern")]
+    return basename
 
 def get_source_ttl_basename(ont_name: str, ont: dict) -> str:
     """Return the on-disk Turtle filename for an ontology module."""
@@ -459,22 +491,41 @@ def resolve_home_ontology(ontology_info: dict, preferred_prefix: str) -> str | N
     """
     Pick the ontology module that owns docs/index.md.
 
-    The home page follows vann:preferredNamespacePrefix when a matching TTL file
-    exists (e.g. its-time.ttl). Otherwise use the module that declares that
-    prefix (e.g. core.ttl with prefix its-time), or the sole remaining module.
+    Preference order:
+      1. Module with mainModule true (master ontology, e.g. 5087-1.ttl)
+      2. TTL basename matching vann:preferredNamespacePrefix (e.g. its-regulation.ttl)
+      3. Non-pattern module declaring that preferred prefix
+      4. Sole remaining non-reqview module
     """
     if not ontology_info:
         return None
+
+    for name, ont in ontology_info.items():
+        if name.endswith("-reqview"):
+            continue
+        if ont.get("main_module"):
+            return name
 
     pref = (preferred_prefix or "").strip()
     if pref and pref in ontology_info:
         return pref
 
-    for name, ont in ontology_info.items():
-        if name.endswith("-reqview"):
-            continue
-        if pref and ont.get("prefix") == pref:
-            return name
+    # Prefer a non-pattern hub that declares the preferred prefix. Every pattern
+    # often shares the same vann:preferredNamespacePrefix, so picking the first
+    # match would wrongly make e.g. Mereology the home page.
+    prefix_matches = [
+        name
+        for name, ont in ontology_info.items()
+        if not name.endswith("-reqview") and pref and ont.get("prefix") == pref
+    ]
+    if prefix_matches:
+        non_patterns = [n for n in prefix_matches if not is_pattern_ttl_file(ontology_info[n])]
+        if len(non_patterns) == 1:
+            return non_patterns[0]
+        if non_patterns:
+            return sorted(non_patterns, key=str.lower)[0]
+        if len(prefix_matches) == 1:
+            return prefix_matches[0]
 
     non_reqview = [n for n in ontology_info if not n.endswith("-reqview")]
     if len(non_reqview) == 1:
@@ -482,11 +533,12 @@ def resolve_home_ontology(ontology_info: dict, preferred_prefix: str) -> str | N
     return non_reqview[0] if non_reqview else None
 
 def should_skip_nav_ontology(ont_name: str, ont: dict) -> bool:
-    """Skip nav for ReqView sidecars, alignment/SHACL modules, and empty shells."""
+    """Skip nav for ReqView sidecars, alignment/SHACL modules, main hub, and empty shells."""
     if ont_name.endswith("-reqview"):
         return True
-    path = (ont.get("file") or "").lower()
-    if path.endswith("-alignment.ttl") or path.endswith("-shacl.ttl"):
+    if ont.get("main_module"):
+        return True
+    if is_shacl_or_alignment_ttl(ont.get("file") or ""):
         return True
     if ont_name == ont.get("prefix"):
         classes = ont.get("classes") or set()
@@ -596,7 +648,7 @@ def get_qname(uri, ns: str, prefix_map: dict):
             return qname
 
     # Fallback
-    if not s.startswith('N'):
+    if not (s.startswith('N') or s.startswith('n')):
         log.warning("No prefix found for URI: %s, namespace: %s, prefix_map:", s, ns)
         for p, u in prefix_map.items():
             log.debug("  %s → %s", p, u)
@@ -633,6 +685,7 @@ def get_ontology_metadata(g: Graph, ns: str, predicate: URIRef) -> Optional[str]
         if isinstance(lit, Literal):
             return str(lit)
     return None
+
 
 def get_preferred_prefix(g: Graph) -> str | None:
     """Extract vann:preferredNamespacePrefix from the owl:Ontology node."""
@@ -772,8 +825,21 @@ def class_restrictions(
         if (restr, RDF.type, OWL.Restriction) in g:
             prop = g.value(restr, OWL.onProperty)
             if prop:
-                prop_qname = get_qname(prop, ns, prefix_map)
-                hyper_prop = hyperlink_concept(prop, ns, prefix_map, global_all_classes, prop_qname, current_doc_dir=current_doc_dir)
+                prop_qname, is_inverse, base_prop = get_property_info(g, prop, ns, prefix_map)
+                if not prop_qname:
+                    prop_qname = get_qname(prop, ns, prefix_map)
+                if is_inverse and base_prop is not None:
+                    hyper_base = hyperlink_concept(
+                        base_prop, ns, prefix_map, global_all_classes,
+                        get_qname(base_prop, ns, prefix_map),
+                        current_doc_dir=current_doc_dir,
+                    )
+                    hyper_prop = f"inverse {hyper_base}"
+                else:
+                    hyper_prop = hyperlink_concept(
+                        prop, ns, prefix_map, global_all_classes, prop_qname,
+                        current_doc_dir=current_doc_dir,
+                    )
                 constr_parts = []
                 # Cardinality
                 for card_p, card_label in [(OWL.cardinality, 'exactly'), (OWL.minCardinality, 'min'), (OWL.maxCardinality, 'max')]:
@@ -791,15 +857,14 @@ def class_restrictions(
                     if values:
                         values_str = get_hyperlinked_class_expression(g, values, ns, prefix_map, global_all_classes, current_doc_dir=current_doc_dir)
                         constr_parts.append(f"{values_label} {values_str}")
-                # hasValue
+                # hasValue — individuals are not property pages; link the IRI
                 has_value = g.value(restr, OWL.hasValue)
                 if has_value:
                     if isinstance(has_value, Literal):
                         constr_parts.append(f"value '{has_value}'")
                     else:
                         hv_qname = get_qname(has_value, ns, prefix_map)
-                        hyper_hv = hyperlink_concept(has_value, ns, prefix_map, global_all_classes, hv_qname, current_doc_dir=current_doc_dir)
-                        constr_parts.append(f"value {hyper_hv}")
+                        constr_parts.append(f"value [{hv_qname}]({has_value})")
                 if constr_parts:
                     rows.append((hyper_prop, ' '.join(constr_parts)))
     return rows
@@ -841,19 +906,25 @@ def get_all_class_superclasses(cls, g):
     return all_supers
 
 def get_property_info(g: Graph, prop: URIRef, ns: str, prefix_map: dict) -> tuple:
-    """Get property name, handling inverses."""
+    """Get property name, handling inverses.
+
+    Only blank-node property expressions ``[ owl:inverseOf P ]`` are treated as
+    inverse *uses*. A named property that *declares* ``owl:inverseOf`` remains
+    a normal property (e.g. ``:contractualElementOf``).
+    """
+    from rdflib.term import BNode as _BNode
+
     if not prop:
         return None, False, None
-    inverse_of = g.value(prop, OWL.inverseOf)
-    if inverse_of:
-        base_prop = inverse_of
-        is_inverse = True
-        prop_name = f"inverse {get_qname(base_prop, ns, prefix_map)}"
-    else:
-        base_prop = prop
-        is_inverse = False
-        prop_name = get_qname(base_prop, ns, prefix_map)
-    return prop_name, is_inverse, base_prop
+    if isinstance(prop, _BNode):
+        inverse_of = g.value(prop, OWL.inverseOf)
+        if inverse_of is not None:
+            return (
+                f"inverse {get_qname(inverse_of, ns, prefix_map)}",
+                True,
+                inverse_of,
+            )
+    return get_qname(prop, ns, prefix_map), False, prop
 
 def is_refined_property(g: Graph, cls: URIRef, prop: URIRef, restriction: URIRef) -> bool:
     """Check if a property restriction in cls refines an inherited restriction."""
@@ -934,7 +1005,10 @@ def hyperlink_concept(
       - "index" for `docs/index.md`
       - "." for root-level docs pages (e.g., class pages like `docs/Foo.md`)
       - "properties" for docs under `docs/properties/` (e.g., property pages)
+      - "classes" for docs under `docs/classes/`
     """
+    from rdflib.term import BNode as _BNode
+
     if isinstance(uri_or_qname, str):
         # Try to resolve qname to full URI
         uri = None
@@ -953,6 +1027,10 @@ def hyperlink_concept(
     if not qname:
         qname = get_qname(uri, ns, prefix_map)
 
+    # Anonymous / blank-node expressions — never invent local .md pages
+    if isinstance(uri, _BNode):
+        return qname
+
     iri = str(uri)
 
     def _prefix_to_site_root() -> str:
@@ -965,30 +1043,37 @@ def hyperlink_concept(
             return "../"
         return ""
 
-    # Local class → markdown link (MkDocs rewrites to site URL)
-    if qname in global_all_classes:
-        prefix = _prefix_to_site_root()
+    # Local class in *this* ontology's namespace only (not imported cdm1:/time:/…)
+    if iri.startswith(ns) and qname in global_all_classes:
         if current_doc_dir.strip("/").lower() == "properties":
             return f"[{qname}](../classes/{qname}.md)"
         if current_doc_dir.strip("/").lower() == "classes":
             return f"[{qname}]({qname}.md)"
         return f"[{qname}](classes/{qname}.md)"
 
-    # Local property (new)
+    # Local non-class term in this namespace (property, individual, datatype)
     if iri.startswith(ns):
+        local = iri[len(ns) :]
+        # UpperCamelCase locals that are not classes are typically custom datatypes
+        # (e.g. EmailAddress) — do not invent properties/*.md links.
+        if local and local[0].isupper():
+            return f"[{qname}]({iri})"
+        # Lowercase locals → property pages (Object/DatatypeProperty)
         prefix = _prefix_to_site_root()
         if current_doc_dir.strip("/").lower() == "classes":
             return f"[{qname}](../properties/{qname}.md)"
         return f"[{qname}]({prefix}properties/{qname}.md)"
 
-    # External known ontologies
+    # External CDM / ITS IRIs (imported classes after owl:imports)
     if iri.startswith("https://w3id.org/citydata/") or iri.startswith("https://w3id.org/itsdata/"):
         return f"[{qname}]({iri})"
 
-    # Other external
-    prefix, local = qname.split(':', 1) if ':' in qname else ('', qname)
+    # Other external vocabularies
+    if ":" in qname:
+        prefix, local = qname.split(":", 1)
+        return f"[{qname}](https://w3id.org/citydata/imported/{prefix}/{local})"
 
-    return f"[{qname}](https://w3id.org/citydata/imported/{prefix}/{local})"
+    return qname
 
 def get_url(uri: URIRef, ns: str, prefix_map: dict, global_all_classes: set, withMd: bool = True) -> str:
     if not uri:
@@ -1004,7 +1089,7 @@ def get_url(uri: URIRef, ns: str, prefix_map: dict, global_all_classes: set, wit
         return f"https://w3id.org/citydata/imported/{prefix}/latest/{local}"
 
 def parse_concept_registry(script_dir):
-    """Same as in your owl version – kept for consistency."""
+    """Load concept registry from ``python/concept_registry.md`` (next to the scripts)."""
     registry_path = os.path.join(script_dir, "concept_registry.md")
     if not os.path.exists(registry_path):
         with open(registry_path, 'w', encoding='utf-8') as f:
@@ -1027,25 +1112,44 @@ def parse_concept_registry(script_dir):
                 if len(values) < 3:
                     continue
                 try:
-                    base_uri = values[headers.index('base_uri')]
-                    name = values[headers.index('name')]
+                    base_uri = values[headers.index('base_uri')].strip('`').strip()
+                    name_cell = values[headers.index('name')].strip()
+                    name, linked_iri = _parse_concept_name_cell(name_cell)
                     concept_type = values[headers.index('type')]
                     description = values[headers.index('description')] if 'description' in headers and len(values) > headers.index('description') else ''
-                    uri = f"{base_uri}{name}"
+                    uri = linked_iri if linked_iri else f"{base_uri}{name}"
                     registry[uri] = {'type': concept_type, 'description': description}
                 except Exception as e:
                     log.warning(f"Skipping row: {line} ({str(e)})")
-    log.debug(f"Loaded {len(registry)} entries from concept_registry.md")
+    log.debug(f"Loaded {len(registry)} entries from {registry_path}")
     return registry
+
+def _parse_concept_name_cell(cell: str) -> tuple[str, Optional[str]]:
+    """Extract concept local name and optional full IRI from a Name cell."""
+    cell = (cell or "").strip().strip('`')
+    m = re.match(r"^\[([^\]]+)\]\((https?://[^)]+)\)$", cell)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return cell, None
+
+def _registry_md_cell(text) -> str:
+    """Make free text safe for a single markdown table cell (no raw newlines or pipes)."""
+    if text is None:
+        return "-"
+    s = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    # Preserve intentional line breaks as HTML so the table stays one row per entry
+    s = "<br>".join(part.strip() for part in s.split("\n"))
+    s = s.replace("|", "\\|")
+    s = re.sub(r"[ \t]+", " ", s).strip()
+    return s or "-"
 
 def update_concept_registry(script_dir, registry):
     registry_path = os.path.join(script_dir, "concept_registry.md")
     with open(registry_path, 'w', encoding='utf-8') as f:
-        f.write("![Draft for review only](../../assets/img/draft_for_review.svg)\n\n")
+        f.write("![Draft for review only](/assets/img/draft_for_review.svg)\n\n")
         f.write("# Concept Registry\n\n")
         f.write("This page lists all known concepts (classes and properties) included in the RITSO.\n\n")
         f.write("| base_uri | name | type | description |\n|----------|------|------|-------------|\n")
-        # Sort by base_uri and then name
         sorted_items = sorted(registry.items(), key=lambda x: (x[0].rsplit('/', 1)[0] if '/' in x[0] else x[0], x[0].rsplit('/', 1)[1] if '/' in x[0] else ''))
         for uri, info in sorted_items:
             base_uri, name = uri.rsplit('/', 1) if '/' in uri else (uri, '')
@@ -1054,14 +1158,21 @@ def update_concept_registry(script_dir, registry):
             if not base_uri.endswith(('#', '/')):
                 base_uri += '/'
             if not base_uri.startswith('N'):
-                f.write(f"| `{base_uri}` | {name} | {info['type']} | {info['description']} |\n")
-    log.info(f"Updated concept_registry.md with {len(registry)} entries")
+                desc = _registry_md_cell(info.get('description', ''))
+                ctype = _registry_md_cell(info.get('type', ''))
+                # Link local name to the concept IRI (same pattern as ontology Official IRI column)
+                name_cell = f"[{name}]({uri})"
+                f.write(f"| `{base_uri}` | {name_cell} | {ctype} | {desc} |\n")
+    log.info(f"Updated {registry_path} with {len(registry)} entries")
 
 def parse_ontology_registry(script_dir):
     registry_path = os.path.join(script_dir, "ontology_registry.md")
     if not os.path.exists(registry_path):
         with open(registry_path, 'w', encoding='utf-8') as f:
-            f.write("|Prefix | Official IRI                                       | RITSO Location     | Description |\n|----------|------|------|-------------|\n")
+            f.write(
+                "| Official IRI | Prefix | Description |\n"
+                "|--------------|--------|-------------|\n"
+            )
         log.info(f"Created new ontology_registry.md in {script_dir}")
         return {}
     content = open(registry_path, 'r', encoding='utf-8').read()
@@ -1069,41 +1180,189 @@ def parse_ontology_registry(script_dir):
     registry = {}
     in_table = False
     headers = None
+    pending = None  # accumulate multiline broken rows until a closing '|'
     for line in lines:
-        if line.strip().startswith('|'):
-            if not in_table:
-                headers = [h.strip().lower() for h in line.split('|') if h.strip()]
+        stripped = line.strip()
+        if not in_table:
+            if stripped.startswith('|'):
+                headers = [h.strip().lower() for h in stripped.split('|') if h.strip()]
                 log.debug(f"Parsed headers: {headers}")
                 in_table = True
-            elif headers and not line.strip().startswith('|---'):
-                values = [v.strip() for v in line.split('|') if v.strip()]
-                log.debug(f"Parsed values: {values}")
-                if len(values) < 4:  # Require all four columns
-                    log.warning(f"Skipping row with insufficient values (expected 4, got {len(values)}): {line}")
-                    continue
-                try:
-                    preferred_prefix = values[0]
-                    official_iri = values[1]
-                    ritso_location = values[2]
-                    description = values[3]
-                    registry[official_iri] = {'preferred_prefix': preferred_prefix, 'ritso_location': ritso_location, 'description': description}
-                except ValueError as e:
-                    log.warning(f"Skipping row due to missing header: {line} ({str(e)})")
-    log.debug(f"Loaded {len(registry)} entries from ontology_registry.md")
+            continue
+        if stripped.startswith('|---'):
+            continue
+        if pending is not None:
+            pending += " " + stripped
+            if stripped.endswith('|'):
+                _ingest_ontology_registry_row(registry, pending, headers)
+                pending = None
+            continue
+        if not stripped.startswith('|'):
+            continue
+        # Complete rows end with '|'; legacy broken rows continue on following lines
+        min_pipes = 4  # at least 3 columns → 4 pipes
+        if stripped.endswith('|') and stripped.count('|') >= min_pipes:
+            _ingest_ontology_registry_row(registry, stripped, headers)
+        else:
+            pending = stripped
+    if pending is not None:
+        _ingest_ontology_registry_row(registry, pending, headers)
+    log.debug(f"Loaded {len(registry)} entries from {registry_path}")
     return registry
 
+
+def ritso_repo_from_iri(official_iri: str) -> Optional[str]:
+    """
+    Map an ontology IRI to the ISO TC 204 GitHub / site repository name.
+
+    Names follow: ontology-(cdm|i72|import|its)-… with topic/version as used on
+    https://isotc204.org/<repo>.
+    """
+    if not official_iri:
+        return None
+    iri = official_iri.strip()
+
+    # ITS topic areas: https://w3id.org/itsdata/{topic}/v{N}/…
+    m = re.match(
+        r"^https://w3id\.org/itsdata/([A-Za-z0-9_-]+)(?:/v(\d+))?(?:/|$)",
+        iri,
+    )
+    if m:
+        topic, ver = m.group(1), m.group(2) or "1"
+        if topic.lower() in ("iso21972", "21972", "i72"):
+            return f"ontology-i72-v{ver}"
+        return f"ontology-its-{topic}-v{ver}"
+
+    # City data model parts: https://w3id.org/citydata/part{N}/v{M}/…
+    m = re.match(
+        r"^https://w3id\.org/citydata/part(\d+)(?:/v(\d+))?(?:/|$)",
+        iri,
+    )
+    if m:
+        return f"ontology-cdm-p{m.group(1)}"
+
+    # ISO 21972 under citydata
+    m = re.match(r"^https://w3id\.org/citydata/21972(?:/v(\d+))?(?:/|$)", iri)
+    if m:
+        return f"ontology-i72-v{m.group(1) or '1'}"
+
+    # Archived / imported vocabularies hosted as ontology-import-*
+    import_map = {
+        "http://www.w3.org/ns/prov#": "ontology-import-prov",
+        "http://www.w3.org/ns/prov-o#": "ontology-import-prov",
+        "http://www.w3.org/ns/prov-aq#": "ontology-import-prov",
+        "http://www.w3.org/ns/prov-dc#": "ontology-import-prov",
+        "http://www.w3.org/ns/prov-dictionary#": "ontology-import-prov",
+        "http://www.w3.org/ns/prov-links#": "ontology-import-prov",
+        "http://www.w3.org/ns/prov-o-inverses#": "ontology-import-prov",
+        "http://www.w3.org/ns/org#": "ontology-import-org",
+        "http://www.w3.org/2006/time#": "ontology-import-time",
+        "http://www.w3.org/2001/XMLSchema#": "ontology-import-xsd",
+        "http://xmlns.com/foaf/0.1/": "ontology-import-foaf",
+        "http://www.w3.org/2003/01/geo/wgs84_pos#": "ontology-import-wgs84",
+        "http://www.opengis.net/ont/geosparql#": "ontology-import-geo",
+        "http://purl.org/goodrelations/v1#": "ontology-import-gr",
+        "http://schema.org/": "ontology-import-schema",
+        "https://schema.org/": "ontology-import-schema",
+    }
+    if iri in import_map:
+        return import_map[iri]
+    # Prefix match for related IRIs (e.g. trailing path under schema.org)
+    for key, repo in import_map.items():
+        if iri.startswith(key.rstrip("#/")):
+            return repo
+    return None
+
+
+def _parse_prefix_cell(cell: str) -> tuple[str, Optional[str]]:
+    """Extract prefix text and optional repo from a Prefix cell (plain or markdown link)."""
+    cell = (cell or "").strip()
+    m = re.match(r"^\[([^\]]+)\]\((https?://[^)]+)\)$", cell)
+    if m:
+        prefix = m.group(1).strip()
+        url = m.group(2).strip().rstrip("/")
+        repo = url.rsplit("/", 1)[-1] if "isotc204.org/" in url else None
+        return prefix, repo
+    return cell, None
+
+
+def _parse_iri_cell(cell: str) -> str:
+    """Extract Official IRI from a plain URL or markdown link ``[iri](iri)``."""
+    cell = (cell or "").strip()
+    m = re.match(r"^\[([^\]]*)\]\((https?://[^)]+)\)$", cell)
+    if m:
+        # Prefer the href (authoritative); fall back to label if needed
+        return (m.group(2) or m.group(1) or "").strip()
+    return cell
+
+
+def _ingest_ontology_registry_row(registry: dict, row: str, headers: Optional[list] = None) -> None:
+    """Parse one ontology-registry table row (supports old and new column layouts)."""
+    flat = " ".join(part.strip() for part in row.replace("\r", "\n").split("\n"))
+    values = [v.strip() for v in flat.split('|') if v.strip()]
+    if len(values) < 3:
+        log.warning(
+            "Skipping ontology registry row with insufficient values (got %d): %s",
+            len(values),
+            flat[:120],
+        )
+        return
+
+    headers_l = [h.lower() for h in (headers or [])]
+    # New layout: Official IRI | Prefix | Description
+    # Legacy: Prefix | Official IRI | RITSO Location | Description
+    if headers_l and headers_l[0].startswith("official"):
+        official_iri = _parse_iri_cell(values[0])
+        preferred_prefix, linked_repo = _parse_prefix_cell(values[1])
+        description = " | ".join(values[2:]) if len(values) > 3 else values[2]
+        ritso_location = linked_repo or ritso_repo_from_iri(official_iri) or ""
+    elif len(values) >= 4 and (not headers_l or headers_l[0] in ("prefix",)):
+        preferred_prefix, linked_repo = _parse_prefix_cell(values[0])
+        official_iri = _parse_iri_cell(values[1])
+        # Legacy column 3 was RITSO location; prefer IRI-derived repo when possible
+        ritso_location = ritso_repo_from_iri(official_iri) or linked_repo or values[2]
+        description = " | ".join(values[3:]) if len(values) > 4 else values[3]
+    else:
+        # Ambiguous 3-column row without headers: assume new layout
+        official_iri = _parse_iri_cell(values[0])
+        preferred_prefix, linked_repo = _parse_prefix_cell(values[1])
+        description = " | ".join(values[2:]) if len(values) > 3 else values[2]
+        ritso_location = linked_repo or ritso_repo_from_iri(official_iri) or ""
+
+    # Strip accidental markdown link leftovers from prefix
+    preferred_prefix = preferred_prefix.strip()
+    registry[official_iri] = {
+        'preferred_prefix': preferred_prefix,
+        'ritso_location': ritso_location or ritso_repo_from_iri(official_iri) or "",
+        'description': description,
+    }
+
+
 def update_ontology_registry(script_dir, ontology_registry):
+    lines = [
+        "![Draft for review only](/assets/img/draft_for_review.svg)\n\n",
+        "# Ontology Registry\n\n",
+        "This page lists all known ontologies included in the RITSO.\n\n",
+        "| Official IRI | Prefix | Description |\n",
+        "|--------------|--------|-------------|\n",
+    ]
+    sorted_items = sorted(ontology_registry.items(), key=lambda x: x[0].lower())
+    for iri, info in sorted_items:
+        prefix = _registry_md_cell(info.get('preferred_prefix', ''))
+        desc = _registry_md_cell(info.get('description', ''))
+        repo = info.get('ritso_location') or ritso_repo_from_iri(iri)
+        if repo and re.match(r"^ontology-(cdm|i72|import|its)-", repo):
+            prefix_cell = f"[{prefix}](https://isotc204.org/{repo})"
+        else:
+            prefix_cell = prefix
+        # Autolink as explicit markdown so MD001/MD034 linters stay quiet
+        iri_cell = f"[{iri}]({iri})"
+        lines.append(f"| {iri_cell} | {prefix_cell} | {desc} |\n")
+    content = "".join(lines)
     registry_path = os.path.join(script_dir, "ontology_registry.md")
     with open(registry_path, 'w', encoding='utf-8') as f:
-        f.write("![Draft for review only](/assets/img/draft_for_review.svg)\n\n")
-        f.write("# Ontology Registry\n\n")
-        f.write("This page lists all known ontologies included in the RITSO.\n\n")
-        f.write("|Prefix | Official IRI | RITSO Location | Description |\n|-------|--------------|----------------|-------------|\n")
-        # Sort by preferred_prefix (case-insensitive)
-        sorted_items = sorted(ontology_registry.items(), key=lambda x: x[1]['preferred_prefix'].lower())
-        for iri, info in sorted_items:
-            f.write(f"| {info['preferred_prefix']} | {iri} | {info['ritso_location']} | {info['description']} |\n")
-    log.info(f"Updated ontology_registry.md with {len(ontology_registry)} entries")
+        f.write(content)
+    log.info(f"Updated {registry_path} with {len(ontology_registry)} entries")
 
 def get_shacl_constraints(g: Graph, cls: URIRef, ns: str, prefix_map: dict) -> dict:
     """

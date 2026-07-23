@@ -5,7 +5,7 @@ import logging
 import shutil
 import traceback
 from collections import defaultdict
-from rdflib import Graph, RDF, OWL, URIRef
+from rdflib import Graph, Namespace, RDF, OWL, URIRef
 from rdflib.namespace import DCTERMS, SKOS, DC, SH, VANN
 from rdflib.plugins.parsers.notation3 import BadSyntax
 
@@ -19,8 +19,10 @@ from utils import (
     get_qname, get_label, is_abstract, get_id,
     get_ontology_metadata, insert_spaces, get_preferred_prefix,
     resolve_home_ontology, load_dev_iri_map, find_dev_iri_map_path,
-    describe_dev_iri_map_search,
+    describe_dev_iri_map_search, is_shacl_or_alignment_ttl, pattern_module_key,
 )
+
+CDM1 = Namespace("https://w3id.org/citydata/part1/v1/")
 from reqview_csv_generator import generate_reqview_update_csv
 
 # -------------------- logging --------------------
@@ -176,10 +178,11 @@ def main():
         base_name = os.path.splitext(os.path.basename(ttl_path))[0]
         # SHACL and alignment modules contribute triples via process_ttl_files,
         # but are not pattern/nav modules of their own.
-        if base_name.endswith('-shacl') or base_name.endswith('-alignment'):
+        if is_shacl_or_alignment_ttl(ttl_path):
             continue
 
-        ont_name = base_name.replace('-pattern', '')   # e.g. fuzzy-time-pattern.ttl → fuzzy-time
+        # e.g. fuzzy-time-pattern.ttl → fuzzy-time, ActivityPattern.ttl → Activity
+        ont_name = pattern_module_key(base_name)
 
         # === Load THIS file alone to discover its direct classes ===
         temp_g = Graph()
@@ -202,11 +205,13 @@ def main():
         module_name = None
         for ont_iri in temp_g.subjects(RDF.type, OWL.Ontology):
             if isinstance(ont_iri, URIRef):
+                # Keep trailing-slash ontology IRIs as empty local name so we fall
+                # back to the file basename (e.g. https://.../v1/ → 5087-1).
                 module_name = str(ont_iri).split("/")[-1].split("#")[-1]
                 if module_name:
                     break
         if not module_name:
-            module_name = ont_name
+            module_name = base_name if base_name.endswith("Pattern") else ont_name
 
         # Nav/pages only for classes in this ontology's master namespace.
         # Foreign IRIs (e.g. alignment subclass targets) must not get local pages.
@@ -232,6 +237,7 @@ def main():
         is_draft = get_ontology_metadata(temp_g, ns,
             URIRef("https://w3id.org/itsdata/core/v1/draft")) or "false"
         prefix = get_ontology_metadata(temp_g, ns, VANN.preferredNamespacePrefix)
+        is_main_module = (get_ontology_metadata(temp_g, ns, CDM1.mainModule) or "").lower() == "true"
 
         ontology_info[ont_name] = {
             "title": title,
@@ -243,7 +249,8 @@ def main():
             "draft": is_draft.lower() == "true",
             "file": ttl_path,                    # for debugging
             "module_name": module_name,          # used for pattern page filename + capitalization
-            "prefix": prefix if prefix else ont_name  # for navigation grouping
+            "prefix": prefix if prefix else ont_name,  # for navigation grouping
+            "main_module": is_main_module,
         }
 
         # Record which pattern owns each class
