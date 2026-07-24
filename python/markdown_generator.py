@@ -12,6 +12,7 @@ from utils import (
     get_ontology_for_uri, hyperlink_concept, get_url, get_shacl_constraints, get_pattern_name,
     resolve_home_ontology, should_skip_nav_ontology, get_source_ttl_basename, is_pattern_ttl_file,
     get_pattern_modules, get_nav_modules, get_hyperlinked_class_expression,
+    format_ontology_meta_markdown,
 )
 from diagram_generator import generate_diagram, get_id
 
@@ -147,8 +148,10 @@ def get_used_by(g: Graph, cls: URIRef, global_all_classes: set, ns: str, prefix_
     log.debug(f"Used by for {cls}: {used_by}")
     return sorted(used_by, key=lambda x: x[0].lower())
 
-def generate_markdown(g: Graph, cls: URIRef, cls_name: str, global_all_classes: set, ns: str, docs_dir: str, errors: list, prefix_map: dict, ns_to_ontology: dict, class_to_onts: dict, isDraft: bool):
+def generate_markdown(g: Graph, cls: URIRef, cls_name: str, global_all_classes: set, ns: str, docs_dir: str, errors: list, prefix_map: dict, ns_to_ontology: dict, class_to_onts: dict, isDraft: bool, global_all_datatypes: set | None = None):
     """Generate Markdown file for a class, including diagram and merged OWL + SHACL formalization."""
+    if global_all_datatypes is None:
+        global_all_datatypes = set()
     classes_dir = os.path.join(docs_dir, "classes")
     os.makedirs(classes_dir, exist_ok=True)
     filename = os.path.join(classes_dir, f"{cls_name}.md")
@@ -228,27 +231,43 @@ def generate_markdown(g: Graph, cls: URIRef, cls_name: str, global_all_classes: 
         log.debug(f"No specializations found for {cls_name}")
     
     # Formalization section with superclasses and disjoints
-    restr_rows = class_restrictions(g, cls, ns, prefix_map, global_all_classes, current_doc_dir="classes")
+    restr_rows = class_restrictions(
+        g, cls, ns, prefix_map, global_all_classes,
+        current_doc_dir="classes",
+        global_all_datatypes=global_all_datatypes,
+    )
     superclasses = []
     disjoints = []    
     # Collect direct superclasses
     for super_cls in g.objects(cls, RDFS.subClassOf):
         if isinstance(super_cls, URIRef) and super_cls != OWL.Thing:
             super_name = get_qname(super_cls, ns, prefix_map)
-            hyper_super = hyperlink_concept(super_cls, ns, prefix_map, global_all_classes, super_name, current_doc_dir="classes")
+            hyper_super = hyperlink_concept(
+                super_cls, ns, prefix_map, global_all_classes, super_name,
+                current_doc_dir="classes",
+                global_all_datatypes=global_all_datatypes,
+            )
             superclasses.append(("subClassOf", hyper_super))
 
     # Collect disjointWith
     for disjoint_cls in g.objects(cls, OWL.disjointWith):
         if isinstance(disjoint_cls, URIRef):
             disjoint_name = get_qname(disjoint_cls, ns, prefix_map)
-            hyper_disjoint = hyperlink_concept(disjoint_cls, ns, prefix_map, global_all_classes, disjoint_name, current_doc_dir="classes")
+            hyper_disjoint = hyperlink_concept(
+                disjoint_cls, ns, prefix_map, global_all_classes, disjoint_name,
+                current_doc_dir="classes",
+                global_all_datatypes=global_all_datatypes,
+            )
             disjoints.append(("disjointWith", hyper_disjoint))    
     
     shacl_rows = []
     shacl_data = get_shacl_constraints(g, cls, ns, prefix_map)
     for prop_name, parts in shacl_data.items():
-        hyper_prop = hyperlink_concept(prop_name, ns, prefix_map, global_all_classes, current_doc_dir="classes")
+        hyper_prop = hyperlink_concept(
+            prop_name, ns, prefix_map, global_all_classes,
+            current_doc_dir="classes",
+            global_all_datatypes=global_all_datatypes,
+        )
         shacl_rows.append((hyper_prop, '; '.join(parts)))
 
     # Combine with restrictions from class_restrictions
@@ -278,7 +297,11 @@ def generate_markdown(g: Graph, cls: URIRef, cls_name: str, global_all_classes: 
                 prefix = used_prop.split(':')[0]
                 display_used += f" ({prefix})"
             link = get_url(used_uri, ns, prefix_map, global_all_classes)
-            hyper_prop = hyperlink_concept(prop_uri, ns, prefix_map, global_all_classes, used_prop, current_doc_dir="classes")
+            hyper_prop = hyperlink_concept(
+                prop_uri, ns, prefix_map, global_all_classes, used_prop,
+                current_doc_dir="classes",
+                global_all_datatypes=global_all_datatypes,
+            )
             used_by_md += f"| [{display_used}]({link}) | {hyper_prop} |\n"
         used_by_md += "\n"
     
@@ -290,7 +313,11 @@ def generate_markdown(g: Graph, cls: URIRef, cls_name: str, global_all_classes: 
         other_annot_md += "| Property | Value |\n"
         other_annot_md += "|----------|-------|\n"
         for pred, val in annotations:
-            hyper_pred = hyperlink_concept(pred, ns, prefix_map, global_all_classes, pred, current_doc_dir="classes")
+            hyper_pred = hyperlink_concept(
+                pred, ns, prefix_map, global_all_classes, pred,
+                current_doc_dir="classes",
+                global_all_datatypes=global_all_datatypes,
+            )
             other_annot_md += f"| {hyper_pred} | {val} |\n"
         other_annot_md += "\n"
     
@@ -326,9 +353,12 @@ def _append_concepts_section(
     properties: list,
     class_link_prefix: str = "classes/",
     prop_link_prefix: str = "properties/",
+    datatypes: list | None = None,
+    datatype_link_prefix: str = "datatypes/",
 ) -> str:
-    """Append markdown lists of direct classes and properties."""
-    if not classes and not properties:
+    """Append markdown lists of direct classes, properties, and datatypes."""
+    datatypes = datatypes or []
+    if not classes and not properties and not datatypes:
         return content
 
     content += f"\n## {section_title}\n\n"
@@ -344,6 +374,11 @@ def _append_concepts_section(
         content += "### Properties\n\n"
         for prop_qname in properties:
             content += f"- [{prop_qname}]({prop_link_prefix}{prop_qname}.md)\n"
+        content += "\n"
+    if datatypes:
+        content += "### Datatypes\n\n"
+        for dt_qname in datatypes:
+            content += f"- [{dt_qname}]({datatype_link_prefix}{dt_qname}.md)\n"
         content += "\n"
     return content
 
@@ -366,25 +401,34 @@ def update_mkdocs_nav(mkdocs_path: str,
         raise
 
     content_nav = [{"Home": "index.md"}]
+    nav_modules = get_nav_modules(ontology_info)
     pattern_modules = get_pattern_modules(ontology_info)
+    # Pattern groupings need separate overview pages. With a single nav module the
+    # home page is index.md, so use a flat Home / Classes / Properties menu.
+    use_pattern_nav = bool(pattern_modules) and len(nav_modules) > 1
 
-    if not pattern_modules:
-        # Single main TTL (no *-pattern.ttl): flat nav — no Pattern/Overview wrapper
+    if not use_pattern_nav:
+        # Flat nav — no Pattern/Overview wrapper
         class_items = []
         prop_items = []
-        for ont_name in get_nav_modules(ontology_info):
+        datatype_items = []
+        for ont_name in nav_modules:
             for cls_name in get_direct_classes_for_ontology(ont_name, ontology_info, class_to_onts):
                 if cls_name == "ITSThing":
                     continue
                 class_items.append({insert_spaces(cls_name): f"classes/{cls_name}.md"})
             for prop_qname in sorted(ontology_info.get(ont_name, {}).get("properties", []) or [], key=str.lower):
                 prop_items.append({prop_qname: f"properties/{prop_qname}.md"})
+            for dt_qname in sorted(ontology_info.get(ont_name, {}).get("datatypes", []) or [], key=str.lower):
+                datatype_items.append({dt_qname: f"datatypes/{dt_qname}.md"})
         if class_items:
             content_nav.append({"Classes": class_items})
         if prop_items:
             content_nav.append({"Properties": prop_items})
+        if datatype_items:
+            content_nav.append({"Datatypes": datatype_items})
     else:
-        for ont_name in get_nav_modules(ontology_info):
+        for ont_name in nav_modules:
             direct_classes = get_direct_classes_for_ontology(ont_name, ontology_info, class_to_onts)
             display_ont = f"{insert_spaces(ont_name)} Pattern"
             ont_nav = [{f"{display_ont} Overview": _pattern_page_relpath(ont_name, ontology_info)}]
@@ -402,6 +446,12 @@ def update_mkdocs_nav(mkdocs_path: str,
                 prop_items.append({prop_qname: f"properties/{prop_qname}.md"})
             if prop_items:
                 ont_nav.append({"Properties": prop_items})
+
+            datatype_items = []
+            for dt_qname in sorted(ontology_info.get(ont_name, {}).get("datatypes", []) or [], key=str.lower):
+                datatype_items.append({dt_qname: f"datatypes/{dt_qname}.md"})
+            if datatype_items:
+                ont_nav.append({"Datatypes": datatype_items})
 
             content_nav.append({display_ont: ont_nav})
 
@@ -431,12 +481,27 @@ def generate_index(g: Graph, ont_name: str, ns: str, prefix_map: dict, ont: dict
     index_content = f"# {ont['title']}\n\n"
     preferred_prefix = get_preferred_prefix(g)
     home_ont_name = resolve_home_ontology(ontology_info, preferred_prefix) or ont_name
+    home_ont = ontology_info.get(home_ont_name, ont)
     if isDraft:
         index_content += "![Draft for review only](https://isotc204.org/assets/img/draft_for_review.svg)\n\n"
     pattern_modules = get_pattern_modules(ontology_info)
-    if pattern_modules:
-        if ont.get("description"):
-            index_content += ont["description"] + "\n\n"
+    nav_modules = get_nav_modules(ontology_info)
+
+    def _append_home_intro(target_ont: dict) -> str:
+        block = ""
+        if target_ont.get("description"):
+            block += target_ont["description"] + "\n\n"
+        block += format_ontology_meta_markdown(
+            notes=target_ont.get("notes"),
+            copyright_notice=target_ont.get("copyright"),
+            license_value=target_ont.get("license"),
+        )
+        return block
+
+    # Multi-module pattern sites list pattern overview pages; a single-file ontology
+    # has only index.md as home, so use the flat single-ontology layout.
+    if pattern_modules and len(nav_modules) > 1:
+        index_content += _append_home_intro(ont)
         index_content += f"The {ont['title']} consists of the following patterns:\n\n"
         for pattern_name in pattern_modules:
             display = insert_spaces(pattern_name)
@@ -450,20 +515,21 @@ def generate_index(g: Graph, ont_name: str, ns: str, prefix_map: dict, ont: dict
             module = ontology_info[module_name]
             direct_classes = get_direct_classes_for_ontology(module_name, ontology_info, class_to_onts)
             direct_props = sorted(module.get("properties") or [], key=str.lower)
-            if not direct_classes and not direct_props:
+            direct_datatypes = sorted(module.get("datatypes") or [], key=str.lower)
+            if not direct_classes and not direct_props and not direct_datatypes:
                 continue
             if module_name == home_ont_name:
                 section_title = "Core concepts"
             else:
                 section_title = module.get("title") or insert_spaces(module_name)
             index_content = _append_concepts_section(
-                index_content, section_title, direct_classes, direct_props
+                index_content, section_title, direct_classes, direct_props,
+                datatypes=direct_datatypes,
             )
     else:
         single_name = home_ont_name if home_ont_name in ontology_info else sorted(ontology_info.keys(), key=str.lower)[0]
         single_ont = ontology_info[single_name]
-        if single_ont.get("description"):
-            index_content += single_ont["description"] + "\n\n"
+        index_content += _append_home_intro(single_ont)
         if single_ont.get("imports"):
             index_content += "This ontology imports the following files:\n\n"
             for imp_iri in single_ont["imports"]:
@@ -471,11 +537,12 @@ def generate_index(g: Graph, ont_name: str, ns: str, prefix_map: dict, ont: dict
             index_content += "\n"
         direct_classes = get_direct_classes_for_ontology(single_name, ontology_info, class_to_onts)
         direct_props = sorted(single_ont.get("properties") or [], key=str.lower)
+        direct_datatypes = sorted(single_ont.get("datatypes") or [], key=str.lower)
         index_content = _append_concepts_section(
-            index_content, "Ontology concepts", direct_classes, direct_props
+            index_content, "Ontology concepts", direct_classes, direct_props,
+            datatypes=direct_datatypes,
         )
 
-    home_ont = ontology_info.get(home_ont_name, ont)
     filename_ttl = get_source_ttl_basename(home_ont_name, home_ont)
     index_content += f"\nThe formal definition of this ontology is available in [TURTLE Syntax]({filename_ttl}).\n"
 
@@ -517,13 +584,17 @@ def generate_pattern_markdown(
 
     direct_classes = get_direct_classes_for_ontology(ont_name, ontology_info, class_to_onts)
     direct_props = sorted(ont.get("properties") or [], key=str.lower)
+    direct_datatypes = sorted(ont.get("datatypes") or [], key=str.lower)
 
     if for_index:
         body = ""
-        if direct_classes or direct_props:
-            body = _append_concepts_section(body, "Ontology concepts", direct_classes, direct_props)
+        if direct_classes or direct_props or direct_datatypes:
+            body = _append_concepts_section(
+                body, "Ontology concepts", direct_classes, direct_props,
+                datatypes=direct_datatypes,
+            )
         elif not direct_classes:
-            body = "This ontology does not declare any classes or properties.\n\n"
+            body = "This ontology does not declare any classes, properties, or datatypes.\n\n"
     else:
         members_md = "This pattern consists of the following classes:\n\n"
         i = 0
@@ -542,7 +613,13 @@ def generate_pattern_markdown(
             for prop_qname in direct_props:
                 props_md += f"- [{prop_qname}](../properties/{prop_qname}.md)\n"
             props_md += "\n"
-        body = members_md + props_md
+        datatypes_md = ""
+        if direct_datatypes:
+            datatypes_md = "This module defines the following datatypes:\n\n"
+            for dt_qname in direct_datatypes:
+                datatypes_md += f"- [{dt_qname}](../datatypes/{dt_qname}.md)\n"
+            datatypes_md += "\n"
+        body = members_md + props_md + datatypes_md
 
     owl_ttl = get_source_ttl_basename(ont_name, ont)
     shacl_ttl = get_shacl_name(ont_name) + ".ttl"
@@ -577,8 +654,11 @@ def generate_pattern_markdown_file(g: Graph, ont_name: str, ns: str, prefix_map:
 
 def generate_property_markdown(g: Graph, prop_uri: URIRef, prop_name: str, 
                                ns: str, prefix_map: dict, docs_dir: str, 
-                               global_all_classes: set, isDraft: bool):
+                               global_all_classes: set, isDraft: bool,
+                               global_all_datatypes: set | None = None):
     """Generate a dedicated Markdown page for a property."""
+    if global_all_datatypes is None:
+        global_all_datatypes = set()
     prop_dir = os.path.join(docs_dir, "properties")
     os.makedirs(prop_dir, exist_ok=True)
 
@@ -592,14 +672,18 @@ def generate_property_markdown(g: Graph, prop_uri: URIRef, prop_name: str,
     for d in list(g.objects(prop_uri, RDFS.domain)) + list(g.objects(prop_uri, SCHEMA.domainIncludes)):
         domain.append(
             get_hyperlinked_class_expression(
-                g, d, ns, prefix_map, global_all_classes, current_doc_dir="properties"
+                g, d, ns, prefix_map, global_all_classes,
+                current_doc_dir="properties",
+                global_all_datatypes=global_all_datatypes,
             )
         )
     range_ = []
     for r in list(g.objects(prop_uri, RDFS.range)) + list(g.objects(prop_uri, SCHEMA.rangeIncludes)):
         range_.append(
             get_hyperlinked_class_expression(
-                g, r, ns, prefix_map, global_all_classes, current_doc_dir="properties"
+                g, r, ns, prefix_map, global_all_classes,
+                current_doc_dir="properties",
+                global_all_datatypes=global_all_datatypes,
             )
         )
         log.debug(f"Range for {prop_name} with {ns} and {r} : {range_}")
@@ -611,7 +695,11 @@ def generate_property_markdown(g: Graph, prop_uri: URIRef, prop_name: str,
             if g.value(pshape, SH.path) == prop_uri:
                 target_cls = g.value(shape, SH.targetClass)
                 if target_cls:
-                        used_in.append(hyperlink_concept(target_cls, ns, prefix_map, global_all_classes, current_doc_dir="properties"))
+                        used_in.append(hyperlink_concept(
+                            target_cls, ns, prefix_map, global_all_classes,
+                            current_doc_dir="properties",
+                            global_all_datatypes=global_all_datatypes,
+                        ))
 
     content = title + (desc + "\n\n" if desc else "")
     
@@ -635,3 +723,29 @@ def generate_property_markdown(g: Graph, prop_uri: URIRef, prop_name: str,
         f.write(content)
 
     log.debug(f"Generated property page: {prop_name}.md")
+
+
+def generate_datatype_markdown(g: Graph, dt_uri: URIRef, dt_name: str,
+                               ns: str, prefix_map: dict, docs_dir: str,
+                               global_all_classes: set, isDraft: bool,
+                               global_all_datatypes: set | None = None):
+    """Generate a dedicated Markdown page for a custom rdfs:Datatype."""
+    if global_all_datatypes is None:
+        global_all_datatypes = set()
+    dt_dir = os.path.join(docs_dir, "datatypes")
+    os.makedirs(dt_dir, exist_ok=True)
+
+    filename = os.path.join(dt_dir, f"{dt_name}.md")
+    title = f"# {dt_name}\n\n"
+    desc = get_definition(g, dt_uri)
+
+    content = title + (desc + "\n\n" if desc else "")
+    content += "**Type**: Datatype\n\n"
+    content += f"**IRI**: `{str(dt_uri)}`\n"
+
+    with open(filename, "w", encoding="utf-8") as f:
+        if isDraft:
+            f.write("![Draft for review only](https://isotc204.org/assets/img/draft_for_review.svg)\n\n")
+        f.write(content)
+
+    log.debug(f"Generated datatype page: {dt_name}.md")

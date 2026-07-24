@@ -1,173 +1,256 @@
+# owl2md.py
 import os
 import sys
 import logging
+import shutil
 import traceback
-import re
 from collections import defaultdict
-from ontology_processor_owl import process_ontology
+from rdflib import Graph, Namespace, RDF, RDFS, OWL, URIRef
+from rdflib.namespace import VANN
+
+from ontology_processor_owl import process_owl_files, parse_owl_file
 from diagram_generator import generate_diagram
 from markdown_generator import (
-    generate_markdown,
-    update_mkdocs_nav,
-    generate_index,
-    generate_pattern_markdown_file,
-    generate_property_markdown,
+    generate_markdown, update_mkdocs_nav, generate_index,
+    generate_pattern_markdown_file, generate_property_markdown,
+    generate_datatype_markdown,
 )
-from utils import get_qname, get_label, is_abstract, get_id, get_ontology_metadata, insert_spaces, get_preferred_prefix
-from rdflib import Graph, RDF, URIRef, Literal, Namespace
-from rdflib.namespace import OWL, DCTERMS, SKOS, RDFS, DC
+from utils import (
+    get_qname, get_label, is_abstract, get_id,
+    get_ontology_metadata, get_ontology_title, get_ontology_description, insert_spaces, get_preferred_prefix,
+    get_ontology_notes, get_ontology_copyright, get_ontology_license,
+    resolve_home_ontology, load_dev_iri_map, find_dev_iri_map_path,
+    describe_dev_iri_map_search, is_shacl_or_alignment_ttl, pattern_module_key,
+)
+from reqview_csv_generator import generate_reqview_update_csv
+
+CDM1 = Namespace("https://w3id.org/citydata/part1/v1/")
 
 # -------------------- logging --------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
+)
 log = logging.getLogger("owl2mkdocs")
 
-def main():
-    CDM1 = Namespace("https://w3id.org/citydata/part1/v1/")
-    ITS_CORE = Namespace("https://w3id.org/itsdata/core/v1/")
 
-    full_title = ""
-    log.info("Starting owl2md.py (RDF/XML → MkDocs + ODM diagrams)")
+def _reset_generated_output_dirs(docs_dir: str) -> None:
+    """Remove and recreate generated output dirs so stale pages/diagrams are not left behind."""
+    for name in ("classes", "properties", "datatypes", "diagrams"):
+        path = os.path.join(docs_dir, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+            log.info(f"Cleared {path}")
+        os.makedirs(path, exist_ok=True)
+
+
+def main():
+    """Main entry point for OWL (RDF/XML) → MkDocs + ODM diagrams."""
+    log.debug("Starting owl2md.py (OWL + SHACL support)")
+
+    create_missing = False
+    if "--create-missing" in sys.argv or "-c" in sys.argv:
+        create_missing = True
+        sys.argv = [arg for arg in sys.argv if arg not in ("--create-missing", "-c")]
+
+    dev_mode = False
+    if "--dev" in sys.argv or "-dev" in sys.argv:
+        dev_mode = True
+        sys.argv = [arg for arg in sys.argv if arg not in ("--dev", "-dev")]
+
+    dev_map_path = None
+    if "--dev-map" in sys.argv:
+        idx = sys.argv.index("--dev-map")
+        if idx + 1 >= len(sys.argv):
+            print("Error: --dev-map requires a file path")
+            sys.exit(1)
+        dev_map_path = sys.argv[idx + 1]
+        dev_mode = True
+        del sys.argv[idx:idx + 2]
 
     if len(sys.argv) != 1:
-        print("Usage: python owl2mkdocs.py")
+        print("Usage: python owl2md.py [--create-missing | -c] [--dev | -dev] [--dev-map PATH]")
+        print("       --create-missing, -c   Include concepts without ReqView ID (will create new objects in ReqView)")
+        print("       --dev, -dev            Remap owl:imports via a local per-user map file (not published IRIs)")
+        print("       --dev-map PATH         Path to IRI map (implies --dev); default: ./dev-iri-map.yml")
         sys.exit(1)
 
-    # Check for mkdocs.yml in current directory
     root_dir = os.getcwd()
     mkdocs_path = os.path.join(root_dir, "mkdocs.yml")
-    if not os.path.exists(mkdocs_path):
-        print("Error: mkdocs.yml not found in current directory")
-        sys.exit(1)
-
-    # Check for docs directory
     docs_dir = os.path.join(root_dir, "docs")
+
+    if not os.path.exists(mkdocs_path):
+        print("Error: mkdocs.yml not found")
+        sys.exit(1)
     if not os.path.isdir(docs_dir):
         print("Error: docs directory not found")
         sys.exit(1)
 
-    # Create diagrams directory if it doesn't exist
     diagrams_dir = os.path.join(docs_dir, "diagrams")
-    if not os.path.exists(diagrams_dir):
-        os.makedirs(diagrams_dir)
-        log.info(f"Created diagrams directory: {diagrams_dir}")
+    os.makedirs(diagrams_dir, exist_ok=True)
+    log.debug(f"Diagrams directory: {diagrams_dir}")
 
-    # Find all .owl files in docs directory
-    owl_files = [os.path.join(docs_dir, f) for f in os.listdir(docs_dir) if f.lower().endswith('.owl')]
+    owl_files = [os.path.join(docs_dir, f) for f in os.listdir(docs_dir)
+                 if f.lower().endswith(".owl")]
     if not owl_files:
         print("No .owl files found in docs/")
         sys.exit(0)
 
-    errors: list[str] = []
+    errors = []
     processed_count = 0
 
-    # === 1) Process each OWL file (with owlready2 inside processor), collect ontology_info + class ownership ===
-    ontology_info: dict[str, dict] = {}
-    class_to_onts: defaultdict[str, set] = defaultdict(set)
-    ns_to_ontology: dict[str, str] = {}
-    graphs: dict[str, tuple[Graph, str, dict, set, list, dict]] = {}
-
-    for owl_path in sorted(owl_files):
-        ont_name = os.path.splitext(os.path.basename(owl_path))[0]
-        per_file_info = {
-            "title": insert_spaces(ont_name),
-            "full_title": insert_spaces(ont_name),
-            "description": "",
-            "classes": set(),
-            "imports": [],
-            "draft": False,
-            "file": owl_path,
-            "prefix": ont_name,
-        }
-
-        g, ns, prefix_map, classes, local_classes, prop_map = process_ontology(owl_path, errors, per_file_info)
-        if g is None:
-            continue
-        graphs[ont_name] = (g, ns, prefix_map, classes, local_classes, prop_map)
-        ns_to_ontology[ns] = ont_name
-
-        # Determine main module title if present
-        is_main_module = get_ontology_metadata(g, ns, CDM1.mainModule)
-        if is_main_module and is_main_module.lower() == "true":
-            full_title = (
-                get_ontology_metadata(g, ns, DCTERMS.title)
-                or get_ontology_metadata(g, ns, DC.title)
-                or per_file_info["title"]
+    dev_map = None
+    if dev_mode:
+        map_file = find_dev_iri_map_path(dev_map_path, search_roots=[root_dir, docs_dir])
+        if not map_file:
+            print("Error: --dev requires a local IRI map file.")
+            print("       Copy dev-iri-map.example.yml → dev-iri-map.yml (gitignored),")
+            print("       or place one at ~/.config/ont2md/dev-iri-map.yml,")
+            print("       or pass --dev-map PATH")
+            print("       Looked for:")
+            for p in describe_dev_iri_map_search(search_roots=[root_dir, docs_dir])[:12]:
+                print(f"         - {p}")
+            sys.exit(1)
+        if "example" in os.path.basename(map_file).lower():
+            print(
+                f"Note: using example map {map_file}\n"
+                f"      Copy it to dev-iri-map.yml (or ~/.config/ont2md/dev-iri-map.yml) "
+                f"for your personal paths."
             )
-            per_file_info["full_title"] = full_title
+        try:
+            dev_map = load_dev_iri_map(map_file)
+        except Exception as e:
+            print(f"Error loading dev IRI map: {e}")
+            sys.exit(1)
+        banner = (
+            f"*** DEV MODE *** Remapping owl:imports via {map_file}\n"
+            f"                 Published w3id/HTTP sources are NOT used for mapped IRIs.\n"
+            f"                 Omit --dev to fetch the live published ontologies."
+        )
+        print(banner)
+        log.warning(banner)
 
-        # Use local class names
-        direct_class_names = set()
-        for cls in local_classes:
-            if isinstance(cls, URIRef) and str(cls).startswith(ns):
-                direct_class_names.add(get_label(g, cls))
-        per_file_info["classes"] = direct_class_names
-
-        for cls_name in direct_class_names:
-            class_to_onts[cls_name].add(ont_name)
-
-        ontology_info[ont_name] = per_file_info
-
-    if not graphs:
-        log.error("No OWL graphs were successfully processed.")
+    # === 1. Load ALL OWL files into one unified graph ===
+    try:
+        g, ns, prefix_map, all_classes, local_classes, prop_map, datatype_map = process_owl_files(
+            owl_files, errors, dev_map=dev_map
+        )
+    except Exception as e:
+        log.error(f"Failed to process OWL files: {e}")
         sys.exit(1)
 
-    # === 2) Unify graphs for cross-file linking/constraints ===
-    unified_g = Graph()
-    ns = None
-    prefix_map = {}
-    all_classes: set = set()
-    local_classes: list = []
-    prop_map: dict = {}
-
-    for _, (g, g_ns, g_prefix_map, classes, locals_, props_) in graphs.items():
-        for t in g:
-            unified_g.add(t)
-        ns = ns or g_ns
-        prefix_map.update(g_prefix_map)
-        all_classes |= set(classes)
-        local_classes += list(locals_)
-        prop_map.update(props_)
-
-    local_classes = list({c for c in local_classes if isinstance(c, URIRef)})
+    log.debug(f"Unified graph ready — {len(g)} triples, {len(local_classes)} local classes")
 
     global_all_classes = {get_qname(c, ns, prefix_map) for c in all_classes if c != OWL.Thing}
-    abstract_map = {get_qname(c, ns, prefix_map): is_abstract(c, unified_g, ns) for c in all_classes}
+    global_all_datatypes = set(datatype_map.keys())
+    abstract_map = {get_qname(c, ns, prefix_map): is_abstract(c, g, ns) for c in all_classes}
+    class_to_onts = defaultdict(set)
+    ns_to_ontology = {ns: "Ontology"}
 
-    isDraft = any(info.get("draft") for info in ontology_info.values())
+    # === 2. Build ontology_info (one entry per module file) ===
+    ontology_info = {}
 
-    # === 3) Generate diagrams + Markdown for every class ===
-    for cls in sorted(local_classes, key=lambda u: get_label(unified_g, u).lower()):
-        cls_name = get_label(unified_g, cls)
-        if cls_name == "ITSThing":
+    for owl_path in owl_files:
+        base_name = os.path.splitext(os.path.basename(owl_path))[0]
+        if is_shacl_or_alignment_ttl(owl_path):
             continue
+
+        ont_name = pattern_module_key(base_name)
+
+        temp_g = Graph()
+        try:
+            parse_owl_file(temp_g, owl_path)
+        except Exception as e:
+            log.error("Error parsing OWL file %s (%s)", owl_path, str(e))
+            sys.exit(2)
+
+        module_name = None
+        for ont_iri in temp_g.subjects(RDF.type, OWL.Ontology):
+            if isinstance(ont_iri, URIRef):
+                module_name = str(ont_iri).split("/")[-1].split("#")[-1]
+                if module_name:
+                    break
+        if not module_name:
+            module_name = base_name if base_name.endswith("Pattern") else ont_name
+
+        direct_classes = set()
+        for s in temp_g.subjects(RDF.type, OWL.Class):
+            if isinstance(s, URIRef) and str(s).startswith(ns):
+                cls_name = get_label(temp_g, s) or get_qname(s, ns, prefix_map)
+                direct_classes.add(cls_name)
+
+        direct_properties = set()
+        for p in temp_g.subjects(RDF.type, OWL.ObjectProperty):
+            if isinstance(p, URIRef) and str(p).startswith(ns):
+                direct_properties.add(get_qname(p, ns, prefix_map))
+        for p in temp_g.subjects(RDF.type, OWL.DatatypeProperty):
+            if isinstance(p, URIRef) and str(p).startswith(ns):
+                direct_properties.add(get_qname(p, ns, prefix_map))
+        direct_datatypes = set()
+        for dt in temp_g.subjects(RDF.type, RDFS.Datatype):
+            if isinstance(dt, URIRef) and str(dt).startswith(ns):
+                direct_datatypes.add(get_qname(dt, ns, prefix_map))
+
+        title = get_ontology_title(temp_g, ns) or insert_spaces(ont_name)
+        desc = get_ontology_description(temp_g, ns) or ""
+        is_draft = get_ontology_metadata(temp_g, ns,
+            URIRef("https://w3id.org/itsdata/core/v1/draft")) or "false"
+        prefix = get_ontology_metadata(temp_g, ns, VANN.preferredNamespacePrefix)
+        is_main_module = (get_ontology_metadata(temp_g, ns, CDM1.mainModule) or "").lower() == "true"
+
+        ontology_info[ont_name] = {
+            "title": title,
+            "full_title": title,
+            "description": desc,
+            "notes": get_ontology_notes(temp_g),
+            "copyright": get_ontology_copyright(temp_g),
+            "license": get_ontology_license(temp_g),
+            "classes": direct_classes,
+            "properties": sorted(direct_properties),
+            "datatypes": sorted(direct_datatypes),
+            "imports": [],
+            "draft": is_draft.lower() == "true",
+            "file": owl_path,
+            "module_name": module_name,
+            "prefix": prefix if prefix else ont_name,
+            "main_module": is_main_module,
+        }
+
+        for cls_name in direct_classes:
+            class_to_onts[cls_name].add(ont_name)
+
+    for ont_name, ont in ontology_info.items():
+        temp_g = Graph()
+        parse_owl_file(temp_g, ont["file"])
+        direct_imports = []
+        for ont_iri in temp_g.subjects(RDF.type, OWL.Ontology):
+            for imported in temp_g.objects(ont_iri, OWL.imports):
+                direct_imports.append(str(imported).strip())
+        ont["imports"] = sorted(set(direct_imports))
+
+    log.debug(f"Built ontology_info with {len(ontology_info)} patterns")
+
+    _reset_generated_output_dirs(docs_dir)
+
+    # === 3. Generate diagrams + Markdown for every class ===
+    for cls in sorted(local_classes, key=lambda u: get_label(g, u).lower()):
+        cls_name = get_label(g, cls)
         cls_id = get_id(cls_name.replace(":", "_"))
+        log.debug(f"Processing class: {cls_name}")
+
         try:
             generate_diagram(
-                unified_g,
-                cls,
-                cls_name,
-                cls_id,
-                ns,
-                global_all_classes,
-                abstract_map,
-                "dummy.owl",
-                errors,
-                prefix_map,
-                "",
-                ns_to_ontology,
+                g, cls, cls_name, cls_id, ns,
+                global_all_classes, abstract_map,
+                "dummy.owl", errors, prefix_map,
+                list(ontology_info.keys())[0] if ontology_info else "",
+                ns_to_ontology
             )
             generate_markdown(
-                unified_g,
-                cls,
-                cls_name,
-                global_all_classes,
-                ns,
-                docs_dir,
-                errors,
-                prefix_map,
-                ns_to_ontology,
-                class_to_onts,
-                isDraft,
+                g, cls, cls_name, global_all_classes, ns, docs_dir,
+                errors, prefix_map, ns_to_ontology, class_to_onts,
+                ontology_info[list(ontology_info.keys())[0]]["draft"] if ontology_info else False,
+                global_all_datatypes=global_all_datatypes,
             )
             processed_count += 1
         except Exception as e:
@@ -175,43 +258,68 @@ def main():
             errors.append(error_msg)
             log.error(error_msg)
 
-    # === 4) Generate property pages (local properties only) ===
-    prop_dir = os.path.join(docs_dir, "properties")
-    os.makedirs(prop_dir, exist_ok=True)
+    # === 4. Generate property documentation pages ===
     for prop_qname, prop_uri in prop_map.items():
         if str(prop_uri).startswith(ns):
             generate_property_markdown(
-                unified_g,
-                prop_uri,
-                prop_qname,
-                ns,
-                prefix_map,
-                docs_dir,
-                global_all_classes,
-                isDraft,
+                g, prop_uri, prop_qname, ns, prefix_map,
+                docs_dir, global_all_classes,
+                ontology_info[list(ontology_info.keys())[0]]["draft"]
+                if ontology_info else False,
+                global_all_datatypes=global_all_datatypes,
             )
 
-    # === 5) Generate pattern pages + index ===
-    preferred_prefix = get_preferred_prefix(unified_g) or ""
-    for ont_name, ont in ontology_info.items():
-        if ont_name == preferred_prefix:
-            generate_index(unified_g, ont_name, ns, prefix_map, ont, docs_dir, ontology_info, errors, class_to_onts, isDraft)
-        else:
-            generate_pattern_markdown_file(unified_g, ont_name, ns, prefix_map, ont, docs_dir, class_to_onts, ontology_info)
+    # === 4b. Generate datatype documentation pages ===
+    for dt_qname, dt_uri in datatype_map.items():
+        if str(dt_uri).startswith(ns):
+            generate_datatype_markdown(
+                g, dt_uri, dt_qname, ns, prefix_map,
+                docs_dir, global_all_classes,
+                ontology_info[list(ontology_info.keys())[0]]["draft"]
+                if ontology_info else False,
+                global_all_datatypes=global_all_datatypes,
+            )
 
-    # === 6) Update mkdocs nav ===
+    # === 5. Generate index + pattern overview pages ===
+    preferred_prefix = get_preferred_prefix(g)
+    home_ont_name = resolve_home_ontology(ontology_info, preferred_prefix)
+    index_generated = False
+    for ont_name, ont in ontology_info.items():
+        log.debug(f"Generating overview for pattern: {ont_name} (preferred prefix: {preferred_prefix})")
+        if ont_name.endswith("-reqview"):
+            continue
+        if ont_name == home_ont_name:
+            generate_index(g, ont_name, ns, prefix_map, ont, docs_dir, ontology_info, errors, class_to_onts, ont["draft"] if ont else True)
+            index_generated = True
+        else:
+            generate_pattern_markdown_file(g, ont_name, ns, prefix_map, ont, docs_dir, class_to_onts, ontology_info)
+
+    if not index_generated and home_ont_name and home_ont_name in ontology_info:
+        ont = ontology_info[home_ont_name]
+        generate_index(g, home_ont_name, ns, prefix_map, ont, docs_dir, ontology_info, errors, class_to_onts, ont["draft"] if ont else True)
+
+    # === 6. Update MkDocs navigation ===
     try:
-        update_mkdocs_nav(mkdocs_path, ontology_info, global_all_classes, errors, class_to_onts, ontology_info, owl_files)
+        update_mkdocs_nav(mkdocs_path, ontology_info, global_all_classes, errors,
+                          class_to_onts, ontology_info, owl_files)
     except Exception as e:
         error_msg = f"Error updating mkdocs.yml: {str(e)}\n{traceback.format_exc()}"
         errors.append(error_msg)
         log.error(error_msg)
 
-    log.info("Total processed classes: %d", processed_count)
+    log.info(f"Finished — processed {processed_count} classes")
     if errors:
-        log.error("Errors occurred:")
+        log.error("Errors encountered:")
         for err in errors:
             log.error(err)
+
+    # === 7. Generate ReqView update CSV ===
+    try:
+        generate_reqview_update_csv(g, local_classes, ns, prefix_map, docs_dir, create_missing)
+    except Exception as e:
+        error_msg = f"Error generating ReqView update CSV: {str(e)}\n{traceback.format_exc()}"
+        errors.append(error_msg)
+        log.error(error_msg)
 
 if __name__ == "__main__":
     main()
