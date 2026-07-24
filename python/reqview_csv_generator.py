@@ -4,9 +4,9 @@ import csv
 import logging
 from datetime import datetime
 from rdflib import Graph, Literal
-from rdflib.namespace import RDF, OWL, RDFS, SKOS, DCTERMS, VANN
+from rdflib.namespace import RDF, OWL, VANN
 
-from utils import get_qname, get_label, get_reqview_id, get_first_literal
+from utils import get_qname, get_label, get_reqview_id, get_definition, get_title
 
 log = logging.getLogger("ttl2mkdocs")
 
@@ -66,8 +66,8 @@ def generate_reqview_update_csv(g: Graph, local_classes: list, ns: str, prefix_m
         if not create_missing and not reqview_id:
             continue
 
-        heading = get_label(g, cls) or qname
-        text = get_first_literal(g, cls, [DCTERMS.description, SKOS.definition, RDFS.comment]) or ""
+        heading = get_title(g, cls) or get_label(g, cls) or qname
+        text = get_definition(g, cls) or ""
 
         rows.append({
             "id": reqview_id or "",
@@ -93,8 +93,8 @@ def generate_reqview_update_csv(g: Graph, local_classes: list, ns: str, prefix_m
         if not create_missing and not reqview_id:
             continue
 
-        heading = get_label(g, prop) or qname
-        text = get_first_literal(g, prop, [DCTERMS.description, SKOS.definition, RDFS.comment]) or ""
+        heading = get_title(g, prop) or get_label(g, prop) or qname
+        text = get_definition(g, prop) or ""
 
         rows.append({
             "id": reqview_id or "",
@@ -120,8 +120,8 @@ def generate_reqview_update_csv(g: Graph, local_classes: list, ns: str, prefix_m
         if not create_missing and not reqview_id:
             continue
 
-        heading = get_label(g, prop) or qname
-        text = get_first_literal(g, prop, [DCTERMS.description, SKOS.definition, RDFS.comment]) or ""
+        heading = get_title(g, prop) or get_label(g, prop) or qname
+        text = get_definition(g, prop) or ""
 
         rows.append({
             "id": reqview_id or "",

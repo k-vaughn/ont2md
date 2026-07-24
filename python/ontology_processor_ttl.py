@@ -13,6 +13,7 @@ from rdflib.namespace import SH, VANN, DCTERMS, SKOS, DC
 from utils import (
     get_qname,
     get_first_literal,
+    get_definition,
     discover_oasis_catalogs,
     resolve_import_iri,
     parse_concept_registry,
@@ -135,8 +136,7 @@ def _parse_rdf_bytes(g: Graph, data: bytes, content_type: str | None = None, pub
 
 
 def _concept_description(g: Graph, uri: URIRef) -> str:
-    text = get_first_literal(g, uri, [SKOS.definition, DCTERMS.description, DC.description, RDFS.comment])
-    return text or "-"
+    return get_definition(g, uri) or "-"
 
 
 def _ritso_location_from_paths(ttl_files: list) -> str:
@@ -184,6 +184,16 @@ def _update_registries_from_graph(g: Graph, ns: str, ttl_files: list, script_dir
                 "description": _concept_description(g, prop),
             }
 
+    for dt in g.subjects(RDF.type, RDFS.Datatype):
+        if not isinstance(dt, URIRef):
+            continue
+        uri = str(dt)
+        if uri not in registry and uri not in new_concepts:
+            new_concepts[uri] = {
+                "type": "datatype",
+                "description": _concept_description(g, dt),
+            }
+
     for uri, info in new_concepts.items():
         registry[uri] = info
     if new_concepts:
@@ -204,10 +214,7 @@ def _update_registries_from_graph(g: Graph, ns: str, ttl_files: list, script_dir
             break
         if not preferred_prefix:
             preferred_prefix = official_iri.rstrip("/#").split("/")[-1].split("#")[-1] or "ontology"
-        description = (
-            get_first_literal(g, ont, [SKOS.definition, DCTERMS.description, DC.description, RDFS.comment])
-            or "-"
-        )
+        description = get_definition(g, ont) or "-"
         if official_iri in ontology_registry:
             # Refresh repo link derivation; keep existing prefix/description unless empty
             existing = ontology_registry[official_iri]
@@ -251,7 +258,8 @@ def _extract_master_namespace(ttl_files: list) -> str:
       1. ``BASE <...>``
       2. ``vann:preferredNamespaceUri`` (IRI or string literal)
       3. Empty prefix ``PREFIX : <...>`` / ``@prefix : <...>``
-      4. Fallback ``https://example.org/``
+      4. ``owl:Ontology`` subject IRI (``rdf:about`` equivalent)
+      5. Fallback ``https://example.org/``
     """
     contents: list[tuple[str, str]] = []
     for ttl_path in ttl_files:
@@ -291,8 +299,20 @@ def _extract_master_namespace(ttl_files: list) -> str:
             log.info(f"Found master namespace from empty prefix ':' in {ttl_path}: {ns}")
             return ns
 
+    for ttl_path, content in contents:
+        # <iri> a owl:Ontology  /  <iri> rdf:type owl:Ontology
+        ont_match = re.search(
+            r"<([^>]+)>\s+(?:a|rdf:type)\s+owl:Ontology\b",
+            content,
+        )
+        if ont_match:
+            ns = _normalize_master_namespace(ont_match.group(1))
+            log.info(f"Found master namespace from owl:Ontology IRI in {ttl_path}: {ns}")
+            return ns
+
     log.warning(
-        "No BASE, vann:preferredNamespaceUri, or empty prefix ':' found – using https://example.org/"
+        "No BASE, vann:preferredNamespaceUri, empty prefix ':', or owl:Ontology IRI "
+        "found – using https://example.org/"
     )
     return "https://example.org/"
 
@@ -615,6 +635,12 @@ def process_ttl_files(ttl_files: list, errors: list, dev_map: dict | None = None
             qn = get_qname(p, ns, prefix_map)
             prop_map[qn] = p
 
+    datatype_map = {}
+    for dt in g.subjects(RDF.type, RDFS.Datatype):
+        if isinstance(dt, URIRef) and str(dt).startswith(ns):
+            qn = get_qname(dt, ns, prefix_map)
+            datatype_map[qn] = dt
+
     xsd_ns = "http://www.w3.org/2001/XMLSchema#"
 
     def _is_local(u) -> bool:
@@ -624,7 +650,7 @@ def process_ttl_files(ttl_files: list, errors: list, dev_map: dict | None = None
         if not _is_local(p):
             return
         qn = get_qname(p, ns, prefix_map)
-        if qn in prop_map:
+        if qn in prop_map or qn in datatype_map:
             return
         prop_map[qn] = p
         g.add((p, RDF.type, OWL.DatatypeProperty))
@@ -659,4 +685,4 @@ def process_ttl_files(ttl_files: list, errors: list, dev_map: dict | None = None
 
     _update_registries_from_graph(g, ns, ttl_files, script_dir)
 
-    return g, ns, prefix_map, classes, local_classes, prop_map
+    return g, ns, prefix_map, classes, local_classes, prop_map, datatype_map

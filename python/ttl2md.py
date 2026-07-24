@@ -5,19 +5,21 @@ import logging
 import shutil
 import traceback
 from collections import defaultdict
-from rdflib import Graph, Namespace, RDF, OWL, URIRef
-from rdflib.namespace import DCTERMS, SKOS, DC, SH, VANN
+from rdflib import Graph, Namespace, RDF, RDFS, OWL, URIRef
+from rdflib.namespace import VANN
 from rdflib.plugins.parsers.notation3 import BadSyntax
 
 from ontology_processor_ttl import process_ttl_files
 from diagram_generator import generate_diagram
 from markdown_generator import (
     generate_markdown, update_mkdocs_nav, generate_index,
-    generate_pattern_markdown_file,generate_property_markdown
+    generate_pattern_markdown_file, generate_property_markdown,
+    generate_datatype_markdown,
 )
 from utils import (
     get_qname, get_label, is_abstract, get_id,
-    get_ontology_metadata, insert_spaces, get_preferred_prefix,
+    get_ontology_metadata, get_ontology_title, get_ontology_description, insert_spaces, get_preferred_prefix,
+    get_ontology_notes, get_ontology_copyright, get_ontology_license,
     resolve_home_ontology, load_dev_iri_map, find_dev_iri_map_path,
     describe_dev_iri_map_search, is_shacl_or_alignment_ttl, pattern_module_key,
 )
@@ -35,7 +37,7 @@ log = logging.getLogger("ttl2mkdocs")
 
 def _reset_generated_output_dirs(docs_dir: str) -> None:
     """Remove and recreate generated output dirs so stale pages/diagrams are not left behind."""
-    for name in ("classes", "properties", "diagrams"):
+    for name in ("classes", "properties", "datatypes", "diagrams"):
         path = os.path.join(docs_dir, name)
         if os.path.isdir(path):
             shutil.rmtree(path)
@@ -153,7 +155,7 @@ def main():
 
     # === 1. Load ALL TTL files into one unified graph ===
     try:
-        g, ns, prefix_map, all_classes, local_classes, prop_map = process_ttl_files(
+        g, ns, prefix_map, all_classes, local_classes, prop_map, datatype_map = process_ttl_files(
             ttl_files, errors, dev_map=dev_map
         )
     except Exception as e:
@@ -164,6 +166,7 @@ def main():
 
     # Global collections
     global_all_classes = {get_qname(c, ns, prefix_map) for c in all_classes if c != OWL.Thing}
+    global_all_datatypes = set(datatype_map.keys())
     abstract_map = {get_qname(c, ns, prefix_map): is_abstract(c, g, ns) for c in all_classes}
     class_to_onts = defaultdict(list)
     ns_to_ontology = {ns: "FuzzyTime"}  # adjust if you have multiple patterns
@@ -221,7 +224,7 @@ def main():
                 cls_name = get_label(temp_g, s) or get_qname(s, ns, prefix_map)
                 direct_classes.add(cls_name)
 
-        # Direct properties defined in this module (used for nav grouping)
+        # Direct properties / datatypes defined in this module (used for nav grouping)
         direct_properties = set()
         for p in temp_g.subjects(RDF.type, OWL.ObjectProperty):
             if isinstance(p, URIRef) and str(p).startswith(ns):
@@ -229,11 +232,14 @@ def main():
         for p in temp_g.subjects(RDF.type, OWL.DatatypeProperty):
             if isinstance(p, URIRef) and str(p).startswith(ns):
                 direct_properties.add(get_qname(p, ns, prefix_map))
+        direct_datatypes = set()
+        for dt in temp_g.subjects(RDF.type, RDFS.Datatype):
+            if isinstance(dt, URIRef) and str(dt).startswith(ns):
+                direct_datatypes.add(get_qname(dt, ns, prefix_map))
 
         # === Metadata for this pattern ===
-        title = get_ontology_metadata(temp_g, ns, DCTERMS.title) or insert_spaces(ont_name)
-        desc = (get_ontology_metadata(temp_g, ns, SKOS.definition) or
-                get_ontology_metadata(temp_g, ns, DCTERMS.description) or "")
+        title = get_ontology_title(temp_g, ns) or insert_spaces(ont_name)
+        desc = get_ontology_description(temp_g, ns) or ""
         is_draft = get_ontology_metadata(temp_g, ns,
             URIRef("https://w3id.org/itsdata/core/v1/draft")) or "false"
         prefix = get_ontology_metadata(temp_g, ns, VANN.preferredNamespacePrefix)
@@ -243,8 +249,12 @@ def main():
             "title": title,
             "full_title": title,
             "description": desc,
+            "notes": get_ontology_notes(temp_g),
+            "copyright": get_ontology_copyright(temp_g),
+            "license": get_ontology_license(temp_g),
             "classes": direct_classes,          # ← only classes defined in THIS file
             "properties": sorted(direct_properties),
+            "datatypes": sorted(direct_datatypes),
             "imports": [],                      # filled below if needed
             "draft": is_draft.lower() == "true",
             "file": ttl_path,                    # for debugging
@@ -303,7 +313,8 @@ def main():
             generate_markdown(
                 g, cls, cls_name, global_all_classes, ns, docs_dir,
                 errors, prefix_map, ns_to_ontology, class_to_onts,
-                ontology_info[list(ontology_info.keys())[0]]["draft"] if ontology_info else False
+                ontology_info[list(ontology_info.keys())[0]]["draft"] if ontology_info else False,
+                global_all_datatypes=global_all_datatypes,
             )
             processed_count += 1
 
@@ -319,7 +330,19 @@ def main():
                 g, prop_uri, prop_qname, ns, prefix_map, 
                 docs_dir, global_all_classes,
                 ontology_info[list(ontology_info.keys())[0]]["draft"] 
-                if ontology_info else False
+                if ontology_info else False,
+                global_all_datatypes=global_all_datatypes,
+            )
+
+    # === 4b. Generate datatype documentation pages ===
+    for dt_qname, dt_uri in datatype_map.items():
+        if str(dt_uri).startswith(ns):
+            generate_datatype_markdown(
+                g, dt_uri, dt_qname, ns, prefix_map,
+                docs_dir, global_all_classes,
+                ontology_info[list(ontology_info.keys())[0]]["draft"]
+                if ontology_info else False,
+                global_all_datatypes=global_all_datatypes,
             )
 
     # === 5. Generate index + pattern overview pages ===

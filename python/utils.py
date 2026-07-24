@@ -11,8 +11,43 @@ from collections import defaultdict
 log = logging.getLogger("ttl2mkdocs")
 
 # -------------------- namespaces --------------------
-DESC_PROPS = (DC.description, SKOS.definition, RDFS.comment, DCTERMS.description)
-SKIP_IN_OTHER = set(DESC_PROPS) | {RDFS.label, DCTERMS.description, SKOS.note, SKOS.example}
+# schema.org appears as both http and https in imported vocabularies
+SCHEMA_NAME = (
+    URIRef("https://schema.org/name"),
+    URIRef("http://schema.org/name"),
+)
+SCHEMA_DESCRIPTION = (
+    URIRef("https://schema.org/description"),
+    URIRef("http://schema.org/description"),
+)
+SCHEMA_COPYRIGHT_NOTICE = (
+    URIRef("https://schema.org/copyrightNotice"),
+    URIRef("http://schema.org/copyrightNotice"),
+)
+SCHEMA_LICENSE = (
+    URIRef("https://schema.org/license"),
+    URIRef("http://schema.org/license"),
+)
+# Not in rdflib's SKOS namespace helpers; used by some vocabularies for titles
+SKOS_TITLE = URIRef(str(SKOS) + "title")
+
+DESC_PROPS = (
+    SKOS.definition,
+    *SCHEMA_DESCRIPTION,
+    DC.description,
+    DCTERMS.description,
+    RDFS.comment,
+)
+SKIP_IN_OTHER = set(DESC_PROPS) | {
+    RDFS.label,
+    SKOS_TITLE,
+    DCTERMS.title,
+    DC.title,
+    *SCHEMA_NAME,
+    SKOS.prefLabel,
+    SKOS.note,
+    SKOS.example,
+}
 
 
 def load_oasis_catalog(catalog_path: str) -> dict:
@@ -450,22 +485,22 @@ def get_shacl_name(ont_name: str) -> str:
     return f"{ont_name}SHACL"
 
 def is_pattern_ttl_file(ont: dict) -> bool:
-    """True when the ontology module is loaded from a pattern TTL file."""
+    """True when the ontology module is loaded from a pattern source file (any RDF ext)."""
     path = ont.get("file") or ""
-    base = os.path.basename(path)
-    lower = base.lower()
-    if lower.endswith("-pattern.ttl"):
+    stem, _ext = os.path.splitext(os.path.basename(path))
+    lower = stem.lower()
+    if lower.endswith("-pattern"):
         return True
-    # UpperCamelCase: ActivityPattern.ttl (not *SHACL.ttl)
-    return base.endswith("Pattern.ttl")
+    # UpperCamelCase: ActivityPattern.ttl / .owl / .ofn (not *SHACL.*)
+    return stem.endswith("Pattern")
 
 def is_shacl_or_alignment_ttl(path_or_basename: str) -> bool:
-    """True for SHACL / alignment companion TTL files (kebab or UpperCamelCase)."""
-    base = os.path.basename(path_or_basename or "")
-    lower = base.lower()
-    if lower.endswith("-shacl.ttl") or lower.endswith("-alignment.ttl"):
+    """True for SHACL / alignment companion files (kebab or UpperCamelCase; any RDF ext)."""
+    stem, _ext = os.path.splitext(os.path.basename(path_or_basename or ""))
+    lower = stem.lower()
+    if lower.endswith("-shacl") or lower.endswith("-alignment"):
         return True
-    return base.endswith("SHACL.ttl") or base.endswith("Alignment.ttl")
+    return stem.endswith("SHACL") or stem.endswith("Alignment")
 
 def pattern_module_key(basename: str) -> str:
     """
@@ -610,7 +645,123 @@ def get_prefix_named_pairs(ontology_doc, ns: str):
     return out
 
 def get_definition(g: Graph, s: URIRef) -> str:
-    return get_first_literal(g, s, [SKOS.definition]) or get_first_literal(g, s, [DCTERMS.description]) or ""
+    """Return a human-readable definition/description for a resource."""
+    return (
+        get_first_literal(g, s, [SKOS.definition])
+        or get_first_literal(g, s, list(SCHEMA_DESCRIPTION))
+        or get_first_literal(g, s, [DCTERMS.description, DC.description])
+        or get_first_literal(g, s, [RDFS.comment])
+        or ""
+    )
+
+
+def get_title(g: Graph, s: URIRef) -> str:
+    """Return a human-readable title/name for a resource."""
+    return (
+        get_first_literal(g, s, [SKOS_TITLE])
+        or get_first_literal(g, s, [DCTERMS.title, DC.title])
+        or get_first_literal(g, s, list(SCHEMA_NAME))
+        or get_first_literal(g, s, [SKOS.prefLabel, RDFS.label])
+        or ""
+    )
+
+
+def get_ontology_title(g: Graph, ns: str) -> Optional[str]:
+    """Title for an owl:Ontology — skos:title, dcterms/dc:title, then schema:name."""
+    for ont in g.subjects(RDF.type, OWL.Ontology):
+        if not isinstance(ont, URIRef):
+            continue
+        title = get_title(g, ont)
+        if title:
+            return title
+    return (
+        get_ontology_metadata(g, ns, SKOS_TITLE)
+        or get_ontology_metadata(g, ns, DCTERMS.title)
+        or get_ontology_metadata(g, ns, DC.title)
+        or get_ontology_metadata(g, ns, SCHEMA_NAME[0])
+        or get_ontology_metadata(g, ns, SCHEMA_NAME[1])
+    )
+
+
+def get_ontology_description(g: Graph, ns: str) -> Optional[str]:
+    """Description for an owl:Ontology — skos:definition, then schema:description, then dcterms/dc."""
+    for ont in g.subjects(RDF.type, OWL.Ontology):
+        if not isinstance(ont, URIRef):
+            continue
+        desc = get_definition(g, ont)
+        if desc:
+            return desc
+    return (
+        get_ontology_metadata(g, ns, SKOS.definition)
+        or get_ontology_metadata(g, ns, SCHEMA_DESCRIPTION[0])
+        or get_ontology_metadata(g, ns, SCHEMA_DESCRIPTION[1])
+        or get_ontology_metadata(g, ns, DCTERMS.description)
+        or get_ontology_metadata(g, ns, DC.description)
+    )
+
+
+def get_ontology_notes(g: Graph) -> List[str]:
+    """All skos:note values on owl:Ontology resources in *g* (order preserved, de-duped)."""
+    notes: List[str] = []
+    seen: set[str] = set()
+    for ont in g.subjects(RDF.type, OWL.Ontology):
+        if not isinstance(ont, URIRef):
+            continue
+        for _, _, lit in g.triples((ont, SKOS.note, None)):
+            text = str(lit).strip()
+            if text and text not in seen:
+                seen.add(text)
+                notes.append(text)
+    return notes
+
+
+def get_ontology_copyright(g: Graph) -> Optional[str]:
+    """schema:copyrightNotice on an owl:Ontology, if present."""
+    for ont in g.subjects(RDF.type, OWL.Ontology):
+        if not isinstance(ont, URIRef):
+            continue
+        notice = get_first_literal(g, ont, list(SCHEMA_COPYRIGHT_NOTICE))
+        if notice:
+            return notice
+    return None
+
+
+def get_ontology_license(g: Graph) -> Optional[str]:
+    """License URI/text from dcterms:license or schema:license on an owl:Ontology."""
+    for ont in g.subjects(RDF.type, OWL.Ontology):
+        if not isinstance(ont, URIRef):
+            continue
+        for pred in (DCTERMS.license, *SCHEMA_LICENSE, DC.rights, DCTERMS.rights):
+            for obj in g.objects(ont, pred):
+                text = str(obj).strip()
+                if text:
+                    return text
+    return None
+
+
+def format_ontology_meta_markdown(
+    notes: Iterable[str] | None = None,
+    copyright_notice: str | None = None,
+    license_value: str | None = None,
+) -> str:
+    """Markdown block for Home-page notes / copyright / license (may be empty)."""
+    parts: List[str] = []
+    for note in notes or []:
+        note = (note or "").strip()
+        if note:
+            parts.append(f"NOTE: {note}\n")
+    if copyright_notice and copyright_notice.strip():
+        parts.append(f"**Copyright**: {copyright_notice.strip()}\n")
+    if license_value and license_value.strip():
+        lic = license_value.strip()
+        if re.match(r"^https?://", lic, re.IGNORECASE):
+            parts.append(f"**License**: [{lic}]({lic})\n")
+        else:
+            parts.append(f"**License**: {lic}\n")
+    if not parts:
+        return ""
+    return "\n".join(parts) + "\n"
+
 
 def get_qname(uri, ns: str, prefix_map: dict):
     if uri is None or not str(uri).strip():
@@ -740,23 +891,46 @@ def get_hyperlinked_class_expression(
     prefix_map: dict,
     global_all_classes: set,
     current_doc_dir: str = ".",
+    global_all_datatypes: set | None = None,
 ) -> str:
     """Convert complex class expression to hyperlinked markdown string."""
     if isinstance(expr, URIRef):
         qname = get_qname(expr, ns, prefix_map)
-        return hyperlink_concept(expr, ns, prefix_map, global_all_classes, qname, current_doc_dir=current_doc_dir)
+        return hyperlink_concept(
+            expr, ns, prefix_map, global_all_classes, qname,
+            current_doc_dir=current_doc_dir,
+            global_all_datatypes=global_all_datatypes,
+        )
     else:  # BNode
         union_col = g.value(expr, OWL.unionOf)
         if union_col and union_col != RDF.nil:
             members = collect_list(g, union_col)
-            return " or ".join(sorted(get_hyperlinked_class_expression(g, m, ns, prefix_map, global_all_classes, current_doc_dir=current_doc_dir) for m in members))
+            return " or ".join(sorted(
+                get_hyperlinked_class_expression(
+                    g, m, ns, prefix_map, global_all_classes,
+                    current_doc_dir=current_doc_dir,
+                    global_all_datatypes=global_all_datatypes,
+                )
+                for m in members
+            ))
         inter_col = g.value(expr, OWL.intersectionOf)
         if inter_col and inter_col != RDF.nil:
             members = collect_list(g, inter_col)
-            return " and ".join(sorted(get_hyperlinked_class_expression(g, m, ns, prefix_map, global_all_classes, current_doc_dir=current_doc_dir) for m in members))
+            return " and ".join(sorted(
+                get_hyperlinked_class_expression(
+                    g, m, ns, prefix_map, global_all_classes,
+                    current_doc_dir=current_doc_dir,
+                    global_all_datatypes=global_all_datatypes,
+                )
+                for m in members
+            ))
         complement = g.value(expr, OWL.complementOf)
         if complement:
-            return "not " + get_hyperlinked_class_expression(g, complement, ns, prefix_map, global_all_classes, current_doc_dir=current_doc_dir)
+            return "not " + get_hyperlinked_class_expression(
+                g, complement, ns, prefix_map, global_all_classes,
+                current_doc_dir=current_doc_dir,
+                global_all_datatypes=global_all_datatypes,
+            )
         oneOf_members = collect_oneOf(g, expr)
         if oneOf_members:
             return "Enum: " + ", ".join(
@@ -768,6 +942,7 @@ def get_hyperlinked_class_expression(
                         global_all_classes,
                         get_qname(m, ns, prefix_map),
                         current_doc_dir=current_doc_dir,
+                        global_all_datatypes=global_all_datatypes,
                     )
                     for m in oneOf_members
                 )
@@ -819,6 +994,7 @@ def class_restrictions(
     prefix_map: dict,
     global_all_classes: set,
     current_doc_dir: str = ".",
+    global_all_datatypes: set | None = None,
 ) -> List[Tuple[str, str]]:
     rows = []
     for restr in g.objects(cls, RDFS.subClassOf):
@@ -833,12 +1009,14 @@ def class_restrictions(
                         base_prop, ns, prefix_map, global_all_classes,
                         get_qname(base_prop, ns, prefix_map),
                         current_doc_dir=current_doc_dir,
+                        global_all_datatypes=global_all_datatypes,
                     )
                     hyper_prop = f"inverse {hyper_base}"
                 else:
                     hyper_prop = hyperlink_concept(
                         prop, ns, prefix_map, global_all_classes, prop_qname,
                         current_doc_dir=current_doc_dir,
+                        global_all_datatypes=global_all_datatypes,
                     )
                 constr_parts = []
                 # Cardinality
@@ -855,7 +1033,11 @@ def class_restrictions(
                 for values_p, values_label in [(OWL.allValuesFrom, 'only'), (OWL.someValuesFrom, 'some')]:
                     values = g.value(restr, values_p)
                     if values:
-                        values_str = get_hyperlinked_class_expression(g, values, ns, prefix_map, global_all_classes, current_doc_dir=current_doc_dir)
+                        values_str = get_hyperlinked_class_expression(
+                            g, values, ns, prefix_map, global_all_classes,
+                            current_doc_dir=current_doc_dir,
+                            global_all_datatypes=global_all_datatypes,
+                        )
                         constr_parts.append(f"{values_label} {values_str}")
                 # hasValue — individuals are not property pages; link the IRI
                 has_value = g.value(restr, OWL.hasValue)
@@ -998,16 +1180,21 @@ def hyperlink_concept(
     global_all_classes: set,
     qname: str = None,
     current_doc_dir: str = ".",
+    global_all_datatypes: set | None = None,
 ) -> str:
-    """Create markdown hyperlink for classes or properties.
+    """Create markdown hyperlink for classes, properties, or datatypes.
 
     current_doc_dir:
       - "index" for `docs/index.md`
       - "." for root-level docs pages (e.g., class pages like `docs/Foo.md`)
-      - "properties" for docs under `docs/properties/` (e.g., property pages)
+      - "properties" for docs under `docs/properties/`
+      - "datatypes" for docs under `docs/datatypes/`
       - "classes" for docs under `docs/classes/`
     """
     from rdflib.term import BNode as _BNode
+
+    if global_all_datatypes is None:
+        global_all_datatypes = set()
 
     if isinstance(uri_or_qname, str):
         # Try to resolve qname to full URI
@@ -1032,37 +1219,37 @@ def hyperlink_concept(
         return qname
 
     iri = str(uri)
+    cd = current_doc_dir.strip("/").lower()
 
     def _prefix_to_site_root() -> str:
-        cd = current_doc_dir.strip("/").lower()
         if cd in ("", ".", "index"):
             return ""
         if cd == "classes":
             return ""
-        if cd == "properties":
+        if cd in ("properties", "datatypes"):
             return "../"
         return ""
 
+    def _local_page_link(folder: str) -> str:
+        """Link to docs/<folder>/<qname>.md from the current doc directory."""
+        if cd == folder:
+            return f"[{qname}]({qname}.md)"
+        if cd in ("properties", "datatypes", "classes"):
+            return f"[{qname}](../{folder}/{qname}.md)"
+        prefix = _prefix_to_site_root()
+        return f"[{qname}]({prefix}{folder}/{qname}.md)"
+
     # Local class in *this* ontology's namespace only (not imported cdm1:/time:/…)
     if iri.startswith(ns) and qname in global_all_classes:
-        if current_doc_dir.strip("/").lower() == "properties":
-            return f"[{qname}](../classes/{qname}.md)"
-        if current_doc_dir.strip("/").lower() == "classes":
-            return f"[{qname}]({qname}.md)"
-        return f"[{qname}](classes/{qname}.md)"
+        return _local_page_link("classes")
 
-    # Local non-class term in this namespace (property, individual, datatype)
+    # Local custom rdfs:Datatype
+    if iri.startswith(ns) and qname in global_all_datatypes:
+        return _local_page_link("datatypes")
+
+    # Local non-class term in this namespace (Object/DatatypeProperty)
     if iri.startswith(ns):
-        local = iri[len(ns) :]
-        # UpperCamelCase locals that are not classes are typically custom datatypes
-        # (e.g. EmailAddress) — do not invent properties/*.md links.
-        if local and local[0].isupper():
-            return f"[{qname}]({iri})"
-        # Lowercase locals → property pages (Object/DatatypeProperty)
-        prefix = _prefix_to_site_root()
-        if current_doc_dir.strip("/").lower() == "classes":
-            return f"[{qname}](../properties/{qname}.md)"
-        return f"[{qname}]({prefix}properties/{qname}.md)"
+        return _local_page_link("properties")
 
     # External CDM / ITS IRIs (imported classes after owl:imports)
     if iri.startswith("https://w3id.org/citydata/") or iri.startswith("https://w3id.org/itsdata/"):

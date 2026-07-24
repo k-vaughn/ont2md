@@ -1,8 +1,14 @@
 # ont2md
 
-This project provides a script to generate a [MkDocs](https://www.mkdocs.org/) site (with ODM-style diagrams) from RDF. The script currently works with Turtle ontology files in `docs/`, although it may be expanded to support other formats (e.g., RDF/XML) in the future.
+This project provides scripts to generate a [MkDocs](https://www.mkdocs.org/) site (with ODM-style diagrams) from RDF sources in `docs/`.
 
-The main entry point for Turtle sources is `python/ttl2md.py`. Related scripts (`owl2md.py`, `ofn2md.py`) are for future use and are not debugged.
+| Entry point | Source format |
+| ----------- | ------------- |
+| `python/ttl2md.py` | Turtle (`.ttl`) |
+| `python/owl2md.py` | RDF/XML (`.owl`) |
+| `python/ofn2md.py` | OWL Functional Syntax (`.ofn`; requires `funowl`) |
+
+All three share the same pipeline: unified graph load, `owl:imports` resolution (catalog / optional `--dev` map / HTTP), registries, diagrams, Markdown, MkDocs nav, and optional ReqView CSV.
 
 ## Prerequisites
 
@@ -44,7 +50,7 @@ The use of ReqView for tracing ontology concepts to use cases is entirely option
 
 No other command-line arguments are accepted. Extra arguments print usage and exit with code `1`.
 
-### Exit behavior
+### Exit behaviour
 
 - **Missing `mkdocs.yml` or `docs/`** — error message, exit `1`
 - **`--dev` without a map file** — error message, exit `1`
@@ -59,13 +65,13 @@ All files matching `docs/*.ttl` (case-insensitive extension) are loaded into one
 ### File naming rules
 
 | Pattern | Example | Role |
-|---------|---------|------|
+| ------- | ------- | ---- |
 | `*-pattern.ttl` | `fuzzy-time-pattern.ttl` | **Pattern module** — overview page, nav section, and classes/properties declared in that file |
 | `*-shacl.ttl` | `fuzzy-time-shacl.ttl` | **SHACL constraints** — merged into diagrams and formalization; not a separate nav “pattern” |
 | `*-reqview.ttl` | `its-time-reqview.ttl` | **ReqView sidecar** — `its-core:reqviewId` annotations; excluded from site index, pattern pages, and MkDocs nav |
 | Other `.ttl` | `core.ttl`, `its-time.ttl` | **Ontology modules** — metadata and locally declared classes/properties; may serve as the site “home” module |
 
-Pattern module ontology names are in UpperCamelCase (for example `fuzzy-time-pattern.ttl` → name of ontology concet within file: `:FuzzyTimePattern`).
+Pattern module ontology names are in UpperCamelCase (for example `fuzzy-time-pattern.ttl` → name of ontology connect within file: `:FuzzyTimePattern`).
 
 ### Namespace and “local” concepts
 
@@ -85,14 +91,14 @@ Each pattern/module file should use a consistent `BASE` and preferred namespace 
 On each `owl:Ontology` (especially in pattern and home modules):
 
 | Property | Used for |
-|----------|----------|
-| `dcterms:title` | Pattern/module title and nav labels |
-| `skos:definition` or `dcterms:description` | Overview and index text |
+| -------- | -------- |
+| `skos:title`, `dcterms:title`, or `schema:name` | Pattern/module title and nav labels |
+| `skos:definition`, `schema:description`, or `dcterms:description` | Overview and index text |
 | `vann:preferredNamespaceUri` | Namespace resolution |
 | `vann:preferredNamespacePrefix` | Home module selection, ReqView CSV filename |
 | `its-core:draft` (`true`/`false`) | Draft banner on generated pages |
 
-On classes, prefer `skos:definition`, `skos:example`, and `skos:note` where applicable.
+On classes, prefer `skos:definition` (or `schema:description`), `skos:example`, and `skos:note` where applicable.
 
 ### ReqView traceability
 
@@ -143,7 +149,7 @@ https://w3id.org/citydata/part1/v1/: ~/GitHub/ontology-cdm-p1/docs/cdm1.ttl
 On each successful TTL load, `ttl2md.py` updates markdown registries next to the script:
 
 | File | Contents |
-|------|----------|
+| ---- | -------- |
 | `python/concept_registry.md` | Classes and properties seen in the unified graph (local + imported) |
 | `python/ontology_registry.md` | `owl:Ontology` IRIs sorted by Official IRI; Prefix links to `https://isotc204.org/<repo>` (e.g. `ontology-its-core-v1`, `ontology-cdm-p1`) |
 
@@ -156,7 +162,7 @@ New entries are appended; existing IRI keys are left unchanged. Both filenames a
 From the project root, under `docs/`:
 
 | Output | Description |
-|--------|-------------|
+| ------ | ----------- |
 | `index.md` | Site home (module chosen by `vann:preferredNamespacePrefix` and file layout; see `resolve_home_ontology` in `utils.py`) |
 | `classes/<ClassName>.md` | One page per **local** class (name = URI local name, e.g. `FuzzyTime`) |
 | `classes/<ModuleName>.md` | Pattern overview for each `*-pattern.ttl` module |
@@ -204,7 +210,7 @@ If the file is absent, navigation is unchanged from the previous flat layout.
 
 This repository’s `docs/` folder illustrates the conventions:
 
-- `<prefered-prefix>.ttl` - (e.g. `its-time.ttl`) imports all pattern ttl files into master for namespace and home metadata (`vann:preferredNamespacePrefix` `its-time`)
+- `<preferred-prefix>.ttl` - (e.g. `its-time.ttl`) imports all pattern ttl files into master for namespace and home metadata (`vann:preferredNamespacePrefix` `its-time`)
 - `core-pattern.ttl` — core module defining concepts that need to be imported by all others (e.g., TimeThing)
 - `fuzzy-time-pattern.ttl` / `schedule-pattern.ttl` — pattern OWL
 - `fuzzy-time-shacl.ttl` / `schedule-shacl.ttl` — SHACL shapes
