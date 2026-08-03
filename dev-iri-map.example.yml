@@ -5,7 +5,7 @@
 #
 # Values may be:
 #   - an ontology file (.ttl / .owl / .rdf), or
-#   - a checkout directory (docs/its-….ttl entrypoint is inferred)
+#   - a checkout directory (entrypoint inferred: docs/its-….ttl, docs/5087-#.ttl, …)
 
 https://w3id.org/citydata/part1/v1/: ~/GitHub/ontology-cdm-p1
 https://w3id.org/citydata/part2/v1/: ~/GitHub/ontology-cdm-p2

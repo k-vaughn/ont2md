@@ -200,14 +200,20 @@ def _entrypoint_in_dir(directory: str, iri: str) -> Optional[str]:
     # Derive a short name from the IRI path (e.g. .../itsdata/vehicle/v1/ → vehicle)
     parts = [p for p in iri.rstrip("/").split("/") if p and p != "v1" and not re.fullmatch(r"v\d+", p)]
     leaf = parts[-1] if parts else ""
-    leaf = leaf.replace("part", "") if leaf.startswith("part") and leaf[4:].isdigit() else leaf
+    # citydata/.../part1/ → part number "1" (also try ISO 5087-1 naming)
+    part_num = leaf[4:] if leaf.startswith("part") and leaf[4:].isdigit() else None
+    if part_num is not None:
+        leaf = part_num
 
     candidates = []
     if leaf:
         for name in (f"its-{leaf}.ttl", f"{leaf}.ttl", f"cdm{leaf}.ttl", f"its-{leaf}.owl", f"{leaf}.owl"):
             candidates.append(os.path.join(docs, name))
+        if leaf.isdigit():
+            for name in (f"5087-{leaf}.ttl", f"5087-{leaf}.owl"):
+                candidates.append(os.path.join(docs, name))
     # Common project entrypoints
-    for name in ("its-core.ttl", "cdm1.ttl", "cdm2.ttl", "cdm3.ttl"):
+    for name in ("its-core.ttl", "cdm1.ttl", "cdm2.ttl", "cdm3.ttl", "5087-1.ttl", "5087-2.ttl", "5087-3.ttl"):
         candidates.append(os.path.join(docs, name))
 
     for p in candidates:
@@ -471,16 +477,23 @@ def _norm_base(u: str) -> str:
     return u.rstrip('/#')
 
 def get_pattern_name(ont_name: str) -> str:
-    # Turtle pattern filenames may be kebab-case (*-pattern.ttl) or UpperCamelCase
-    # (*Pattern.ttl). The generated pattern page uses ontology_info.module_name.
-    return f"{ont_name}-pattern"
+    """Return conventional pattern basename (no .ttl) for a module key.
+
+    Prefer UpperCamelCase ``*Pattern`` (current convention). Fall back to
+    legacy kebab-case ``*-pattern`` only for hyphenated / all-lowercase keys.
+    """
+    if ont_name.endswith("Pattern"):
+        return ont_name
+    if "-" in ont_name or ont_name == ont_name.lower():
+        return f"{ont_name}-pattern"
+    return f"{ont_name}Pattern"
 
 def get_shacl_name(ont_name: str) -> str:
     """Return the SHACL companion basename (no .ttl) for a pattern module key."""
     if ont_name.endswith("Pattern"):
         return ont_name[: -len("Pattern")] + "SHACL"
     # kebab-case / all-lowercase modules → *-shacl
-    if "-" in ont_name or ont_name == ont_name.lower():
+    if "-" in ont_name and ont_name == ont_name.lower():
         return f"{ont_name}-shacl"
     return f"{ont_name}SHACL"
 
@@ -578,7 +591,8 @@ def should_skip_nav_ontology(ont_name: str, ont: dict) -> bool:
     if ont_name == ont.get("prefix"):
         classes = ont.get("classes") or set()
         properties = ont.get("properties") or []
-        if not classes and not properties:
+        datatypes = ont.get("datatypes") or []
+        if not classes and not properties and not datatypes:
             return True
     return False
 
@@ -995,6 +1009,7 @@ def class_restrictions(
     global_all_classes: set,
     current_doc_dir: str = ".",
     global_all_datatypes: set | None = None,
+    global_all_properties: set | None = None,
 ) -> List[Tuple[str, str]]:
     rows = []
     for restr in g.objects(cls, RDFS.subClassOf):
@@ -1010,6 +1025,7 @@ def class_restrictions(
                         get_qname(base_prop, ns, prefix_map),
                         current_doc_dir=current_doc_dir,
                         global_all_datatypes=global_all_datatypes,
+                        global_all_properties=global_all_properties,
                     )
                     hyper_prop = f"inverse {hyper_base}"
                 else:
@@ -1017,6 +1033,7 @@ def class_restrictions(
                         prop, ns, prefix_map, global_all_classes, prop_qname,
                         current_doc_dir=current_doc_dir,
                         global_all_datatypes=global_all_datatypes,
+                        global_all_properties=global_all_properties,
                     )
                 constr_parts = []
                 # Cardinality
@@ -1181,6 +1198,7 @@ def hyperlink_concept(
     qname: str = None,
     current_doc_dir: str = ".",
     global_all_datatypes: set | None = None,
+    global_all_properties: set | None = None,
 ) -> str:
     """Create markdown hyperlink for classes, properties, or datatypes.
 
@@ -1190,6 +1208,10 @@ def hyperlink_concept(
       - "properties" for docs under `docs/properties/`
       - "datatypes" for docs under `docs/datatypes/`
       - "classes" for docs under `docs/classes/`
+
+    global_all_properties:
+      Local object/datatype property qnames that have documentation pages.
+      When provided, local annotation-only terms are not linked (no pages).
     """
     from rdflib.term import BNode as _BNode
 
@@ -1247,8 +1269,10 @@ def hyperlink_concept(
     if iri.startswith(ns) and qname in global_all_datatypes:
         return _local_page_link("datatypes")
 
-    # Local non-class term in this namespace (Object/DatatypeProperty)
+    # Local non-class term in this namespace (Object/DatatypeProperty pages only)
     if iri.startswith(ns):
+        if global_all_properties is not None and qname not in global_all_properties:
+            return qname
         return _local_page_link("properties")
 
     # External CDM / ITS IRIs (imported classes after owl:imports)
@@ -1310,6 +1334,50 @@ def parse_concept_registry(script_dir):
                     log.warning(f"Skipping row: {line} ({str(e)})")
     log.debug(f"Loaded {len(registry)} entries from {registry_path}")
     return registry
+
+
+def uri_mentioned_in_graph(g: Graph, u: URIRef) -> bool:
+    """True if ``u`` appears as subject, predicate, or object in ``g``."""
+    return (u, None, None) in g or (None, u, None) in g or (None, None, u) in g
+
+
+def apply_registry_types_for_present_terms(g: Graph, registry: dict, ns: str) -> None:
+    """
+    Add owl:ObjectProperty / owl:DatatypeProperty types from the concept registry
+    only for IRIs that already appear in the loaded graph.
+
+    This lets SHACL/restriction-only mentions pick up a type without resurrecting
+    deleted concepts that still linger in the registry.
+    """
+    for uri, info in registry.items():
+        if not str(uri).startswith(ns):
+            continue
+        u = URIRef(uri)
+        if not uri_mentioned_in_graph(g, u):
+            continue
+        ctype = info.get("type")
+        if ctype == "object_property":
+            g.add((u, RDF.type, OWL.ObjectProperty))
+        elif ctype == "datatype_property":
+            g.add((u, RDF.type, OWL.DatatypeProperty))
+
+
+def prune_stale_master_ns_registry_entries(registry: dict, g: Graph, ns: str) -> int:
+    """
+    Remove concept-registry entries under the master namespace that are absent from ``g``.
+
+    Other namespaces are left alone (this run may not have loaded those ontologies).
+    """
+    stale = [uri for uri in registry if str(uri).startswith(ns) and not uri_mentioned_in_graph(g, URIRef(uri))]
+    for uri in stale:
+        del registry[uri]
+    if stale:
+        log.info(
+            "Pruned %d stale concept-registry entries under %s",
+            len(stale),
+            ns,
+        )
+    return len(stale)
 
 def _parse_concept_name_cell(cell: str) -> tuple[str, Optional[str]]:
     """Extract concept local name and optional full IRI from a Name cell."""
@@ -1586,6 +1654,13 @@ def get_shacl_constraints(g: Graph, cls: URIRef, ns: str, prefix_map: dict) -> d
             path = g.value(prop_shape, SH.path)
             if not path:
                 continue
+            # Skip annotation properties: SHACL shapes are for instance data
+            # constraints. Annotation properties with rdfs:domain of this class
+            # apply to instances (not shown on class pages); annotation *values*
+            # asserted on the class itself are handled separately under
+            # "Other annotations".
+            if (path, RDF.type, OWL.AnnotationProperty) in g:
+                continue
 
             prop_name = get_qname(path, ns, prefix_map)
 
@@ -1686,6 +1761,10 @@ def get_shacl_constraints(g: Graph, cls: URIRef, ns: str, prefix_map: dict) -> d
                         constraints[prop_name].append(f"min {min_count}")
                     if max_count is not None:
                         constraints[prop_name].append(f"max {max_count}")
+                    if min_count is None and max_count is None:
+                        # Path-only property shape: still associate the property
+                        # with the class (open range / unconstrained).
+                        constraints[prop_name].append("")
     return constraints
 
 def get_shacl_diagram_constraints(g: Graph, cls: URIRef, ns: str, prefix_map: dict) -> dict:
@@ -1754,7 +1833,12 @@ def get_shacl_diagram_constraints(g: Graph, cls: URIRef, ns: str, prefix_map: di
             path = g.value(prop_shape, SH.path)
             if not path:
                 continue
+            # Skip annotation properties (instance-level; not shown on class pages).
+            if (path, RDF.type, OWL.AnnotationProperty) in g:
+                continue
             prop_name = get_qname(path, ns, prefix_map)
+            # Ensure path-only shapes are recorded (open / unconstrained ranges).
+            constraints[prop_name]
 
             node_refs = list(g.objects(prop_shape, SH.node))
 

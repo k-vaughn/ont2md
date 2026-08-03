@@ -21,6 +21,8 @@ from utils import (
     parse_ontology_registry,
     update_ontology_registry,
     ritso_repo_from_iri,
+    apply_registry_types_for_present_terms,
+    prune_stale_master_ns_registry_entries,
 )
 
 log = logging.getLogger("ttl2mkdocs")
@@ -198,6 +200,7 @@ def _update_registries_from_graph(g: Graph, ns: str, ttl_files: list, script_dir
         registry[uri] = info
     if new_concepts:
         log.info("Registering %d new concepts in concept_registry.md", len(new_concepts))
+    prune_stale_master_ns_registry_entries(registry, g, ns)
     update_concept_registry(script_dir, registry)
 
     for ont in g.subjects(RDF.type, OWL.Ontology):
@@ -604,14 +607,7 @@ def process_ttl_files(ttl_files: list, errors: list, dev_map: dict | None = None
 
     script_dir = os.path.dirname(os.path.realpath(__file__))
     registry = parse_concept_registry(script_dir)
-
-    for uri, info in registry.items():
-        u = URIRef(uri)
-        if str(u).startswith(ns):
-            if info["type"] == "object_property":
-                g.add((u, RDF.type, OWL.ObjectProperty))
-            elif info["type"] == "datatype_property":
-                g.add((u, RDF.type, OWL.DatatypeProperty))
+    apply_registry_types_for_present_terms(g, registry, ns)
 
     classes = set(g.subjects(RDF.type, OWL.Class)) - {OWL.Thing}
     for shape in g.subjects(RDF.type, SH.NodeShape):
@@ -676,12 +672,6 @@ def process_ttl_files(ttl_files: list, errors: list, dev_map: dict | None = None
                 if dt is not None:
                     _add_datatype_prop(path)
                     break
-
-    for uri, info in registry.items():
-        if info["type"] in ("object_property", "datatype_property") and str(uri).startswith(ns):
-            u = URIRef(uri)
-            qn = get_qname(u, ns, prefix_map)
-            prop_map[qn] = u
 
     _update_registries_from_graph(g, ns, ttl_files, script_dir)
 

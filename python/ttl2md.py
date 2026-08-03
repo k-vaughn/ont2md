@@ -167,6 +167,7 @@ def main():
     # Global collections
     global_all_classes = {get_qname(c, ns, prefix_map) for c in all_classes if c != OWL.Thing}
     global_all_datatypes = set(datatype_map.keys())
+    global_all_properties = set(prop_map.keys())
     abstract_map = {get_qname(c, ns, prefix_map): is_abstract(c, g, ns) for c in all_classes}
     class_to_onts = defaultdict(list)
     ns_to_ontology = {ns: "FuzzyTime"}  # adjust if you have multiple patterns
@@ -315,6 +316,7 @@ def main():
                 errors, prefix_map, ns_to_ontology, class_to_onts,
                 ontology_info[list(ontology_info.keys())[0]]["draft"] if ontology_info else False,
                 global_all_datatypes=global_all_datatypes,
+                global_all_properties=global_all_properties,
             )
             processed_count += 1
 

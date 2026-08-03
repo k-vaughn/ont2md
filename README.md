@@ -153,7 +153,11 @@ On each successful TTL load, `ttl2md.py` updates markdown registries next to the
 | `python/concept_registry.md` | Classes and properties seen in the unified graph (local + imported) |
 | `python/ontology_registry.md` | `owl:Ontology` IRIs sorted by Official IRI; Prefix links to `https://isotc204.org/<repo>` (e.g. `ontology-its-core-v1`, `ontology-cdm-p1`) |
 
-New entries are appended; existing IRI keys are left unchanged. Both filenames are listed in `.gitignore` (local tooling artifacts). The OWL/OFN processors already wrote these files; the TTL path now does as well.
+New entries are appended; existing IRI keys are left unchanged except that entries under the
+**master namespace of the ontology being processed** are pruned when they no longer appear in the
+loaded graph (so renamed/removed local concepts do not keep regenerating pages). Both filenames
+are listed in `.gitignore` (local tooling artifacts). The OWL/OFN processors already wrote these
+files; the TTL path now does as well.
 
 ### Concept registry (manual extras)
 

@@ -11,6 +11,11 @@ from utils import get_qname, get_label, get_reqview_id, get_definition, get_titl
 log = logging.getLogger("ttl2mkdocs")
 
 
+def _website_html(iri: str) -> str:
+    """ReqView-friendly HTML fragment linking to the concept IRI."""
+    return f"<html><body><a href='{iri}'>Web</a></body></html>"
+
+
 def generate_reqview_update_csv(g: Graph, local_classes: list, ns: str, prefix_map: dict, docs_dir: str, create_missing: bool = False):
     """
     Generate ONE ReqView update CSV for the current namespace.
@@ -76,7 +81,7 @@ def generate_reqview_update_csv(g: Graph, local_classes: list, ns: str, prefix_m
             "text": text[:500],
             "type": "Class",
             "diagram": f"{ns}diagrams/{qname}.dot.svg",
-            "website": f"{ns}{qname}",
+            "website": _website_html(str(cls)),
             "updated": now
         })
 
@@ -103,7 +108,7 @@ def generate_reqview_update_csv(g: Graph, local_classes: list, ns: str, prefix_m
             "text": text[:500],
             "type": "ObjectProperty",
             "diagram": "",                    # properties usually don't have diagrams yet
-            "website": f"{ns}{qname}",          # you can generate property pages later if desired
+            "website": _website_html(str(prop)),
             "updated": now
         })
 
@@ -130,7 +135,7 @@ def generate_reqview_update_csv(g: Graph, local_classes: list, ns: str, prefix_m
             "text": text[:500],
             "type": "DatatypeProperty",
             "diagram": "",
-            "website": f"{ns}{qname}",
+            "website": _website_html(str(prop)),
             "updated": now
         })
 

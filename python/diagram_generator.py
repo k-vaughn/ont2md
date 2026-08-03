@@ -284,10 +284,20 @@ def generate_diagram(g: Graph, cls: URIRef, cls_name: str, cls_id: str, ns: str,
         shacl_data = get_shacl_diagram_constraints(g, cls, ns, prefix_map)
         for prop_name, parts in shacl_data.items():
             is_datatype = True
+            prop_uri = None
             for p in g.subjects(RDF.type, OWL.ObjectProperty):
                 if get_qname(p, ns, prefix_map) == prop_name:
                     is_datatype = False
+                    prop_uri = p
                     break
+
+            # Open-range object properties (no sh:class / rdfs:range): show in the
+            # attribute compartment instead of drawing an owl:Thing association.
+            if not is_datatype and prop_uri is not None:
+                has_sh_range = 'range' in parts or 'datatype' in parts
+                has_rdfs_range = g.value(prop_uri, RDFS.range) is not None
+                if not has_sh_range and not has_rdfs_range:
+                    is_datatype = True
 
             if is_datatype:
                 if prop_name not in data_props:

@@ -148,10 +148,12 @@ def get_used_by(g: Graph, cls: URIRef, global_all_classes: set, ns: str, prefix_
     log.debug(f"Used by for {cls}: {used_by}")
     return sorted(used_by, key=lambda x: x[0].lower())
 
-def generate_markdown(g: Graph, cls: URIRef, cls_name: str, global_all_classes: set, ns: str, docs_dir: str, errors: list, prefix_map: dict, ns_to_ontology: dict, class_to_onts: dict, isDraft: bool, global_all_datatypes: set | None = None):
+def generate_markdown(g: Graph, cls: URIRef, cls_name: str, global_all_classes: set, ns: str, docs_dir: str, errors: list, prefix_map: dict, ns_to_ontology: dict, class_to_onts: dict, isDraft: bool, global_all_datatypes: set | None = None, global_all_properties: set | None = None):
     """Generate Markdown file for a class, including diagram and merged OWL + SHACL formalization."""
     if global_all_datatypes is None:
         global_all_datatypes = set()
+    if global_all_properties is None:
+        global_all_properties = set()
     classes_dir = os.path.join(docs_dir, "classes")
     os.makedirs(classes_dir, exist_ok=True)
     filename = os.path.join(classes_dir, f"{cls_name}.md")
@@ -235,6 +237,7 @@ def generate_markdown(g: Graph, cls: URIRef, cls_name: str, global_all_classes: 
         g, cls, ns, prefix_map, global_all_classes,
         current_doc_dir="classes",
         global_all_datatypes=global_all_datatypes,
+        global_all_properties=global_all_properties,
     )
     superclasses = []
     disjoints = []    
@@ -246,6 +249,7 @@ def generate_markdown(g: Graph, cls: URIRef, cls_name: str, global_all_classes: 
                 super_cls, ns, prefix_map, global_all_classes, super_name,
                 current_doc_dir="classes",
                 global_all_datatypes=global_all_datatypes,
+                global_all_properties=global_all_properties,
             )
             superclasses.append(("subClassOf", hyper_super))
 
@@ -257,6 +261,7 @@ def generate_markdown(g: Graph, cls: URIRef, cls_name: str, global_all_classes: 
                 disjoint_cls, ns, prefix_map, global_all_classes, disjoint_name,
                 current_doc_dir="classes",
                 global_all_datatypes=global_all_datatypes,
+                global_all_properties=global_all_properties,
             )
             disjoints.append(("disjointWith", hyper_disjoint))    
     
@@ -267,6 +272,7 @@ def generate_markdown(g: Graph, cls: URIRef, cls_name: str, global_all_classes: 
             prop_name, ns, prefix_map, global_all_classes,
             current_doc_dir="classes",
             global_all_datatypes=global_all_datatypes,
+            global_all_properties=global_all_properties,
         )
         shacl_rows.append((hyper_prop, '; '.join(parts)))
 
@@ -301,6 +307,7 @@ def generate_markdown(g: Graph, cls: URIRef, cls_name: str, global_all_classes: 
                 prop_uri, ns, prefix_map, global_all_classes, used_prop,
                 current_doc_dir="classes",
                 global_all_datatypes=global_all_datatypes,
+                global_all_properties=global_all_properties,
             )
             used_by_md += f"| [{display_used}]({link}) | {hyper_prop} |\n"
         used_by_md += "\n"
@@ -313,10 +320,13 @@ def generate_markdown(g: Graph, cls: URIRef, cls_name: str, global_all_classes: 
         other_annot_md += "| Property | Value |\n"
         other_annot_md += "|----------|-------|\n"
         for pred, val in annotations:
+            # Annotation properties do not get documentation pages — show plain
+            # names for them. Object/datatype properties and external terms still link.
             hyper_pred = hyperlink_concept(
                 pred, ns, prefix_map, global_all_classes, pred,
                 current_doc_dir="classes",
                 global_all_datatypes=global_all_datatypes,
+                global_all_properties=global_all_properties,
             )
             other_annot_md += f"| {hyper_pred} | {val} |\n"
         other_annot_md += "\n"
@@ -365,8 +375,8 @@ def _append_concepts_section(
     if classes:
         content += "### Classes\n\n"
         for cls_name in classes:
-            if cls_name == "ITSThing":
-                continue
+            # if cls_name == "ITSThing":
+            #    continue
             display_cls = insert_spaces(cls_name)
             content += f"- [{display_cls}]({class_link_prefix}{cls_name}.md)\n"
         content += "\n"
@@ -414,8 +424,8 @@ def update_mkdocs_nav(mkdocs_path: str,
         datatype_items = []
         for ont_name in nav_modules:
             for cls_name in get_direct_classes_for_ontology(ont_name, ontology_info, class_to_onts):
-                if cls_name == "ITSThing":
-                    continue
+                # if cls_name == "ITSThing":
+                #    continue
                 class_items.append({insert_spaces(cls_name): f"classes/{cls_name}.md"})
             for prop_qname in sorted(ontology_info.get(ont_name, {}).get("properties", []) or [], key=str.lower):
                 prop_items.append({prop_qname: f"properties/{prop_qname}.md"})
@@ -435,8 +445,8 @@ def update_mkdocs_nav(mkdocs_path: str,
 
             class_items = []
             for cls_name in direct_classes:
-                if cls_name == "ITSThing":
-                    continue
+                # if cls_name == "ITSThing":
+                #     continue
                 class_items.append({insert_spaces(cls_name): f"classes/{cls_name}.md"})
             if class_items:
                 ont_nav.append({"Classes": class_items})
@@ -557,6 +567,55 @@ def generate_index(g: Graph, ont_name: str, ns: str, prefix_map: dict, ont: dict
         log.error(error_msg)
         raise
 
+def _pattern_ttl_pair(ont_name: str, ont: dict, docs_dir: str) -> tuple[str, str | None]:
+    """
+    Resolve (pattern.ttl, shacl.ttl) basenames for the pattern-page closing sentence.
+
+    Prefer the conventional UpperCamelCase pair
+    ``<PatternName>Pattern.ttl`` / ``<PatternName>SHACL.ttl`` when those files
+    exist (or when ``module_name`` already uses that form). Fall back to the
+    on-disk pattern filename and ``get_shacl_name`` for kebab-case checkouts.
+    """
+    source_ttl = get_source_ttl_basename(ont_name, ont)
+    module_name = (ont.get("module_name") or "").strip()
+    if not module_name and source_ttl.lower().endswith(".ttl"):
+        module_name = source_ttl[:-4]
+
+    stem = None
+    camel_pattern = None
+    camel_shacl = None
+    if module_name.endswith("Pattern"):
+        stem = module_name[: -len("Pattern")]
+        camel_pattern = f"{module_name}.ttl"
+        camel_shacl = f"{stem}SHACL.ttl"
+    elif source_ttl.endswith("Pattern.ttl"):
+        stem = source_ttl[: -len("Pattern.ttl")]
+        camel_pattern = source_ttl
+        camel_shacl = f"{stem}SHACL.ttl"
+
+    pattern_ttl = source_ttl
+    if camel_pattern and (
+        os.path.exists(os.path.join(docs_dir, camel_pattern))
+        or not os.path.exists(os.path.join(docs_dir, source_ttl))
+    ):
+        pattern_ttl = camel_pattern
+
+    shacl_candidates = []
+    if camel_shacl:
+        shacl_candidates.append(camel_shacl)
+    shacl_candidates.append(f"{get_shacl_name(ont_name)}.ttl")
+    if source_ttl.lower().endswith("-pattern.ttl"):
+        shacl_candidates.append(source_ttl[: -len("-pattern.ttl")] + "-shacl.ttl")
+    if source_ttl.endswith("Pattern.ttl"):
+        shacl_candidates.append(source_ttl[: -len("Pattern.ttl")] + "SHACL.ttl")
+
+    for cand in shacl_candidates:
+        if os.path.exists(os.path.join(docs_dir, cand)):
+            return pattern_ttl, cand
+
+    return pattern_ttl, None
+
+
 def generate_pattern_markdown(
     g: Graph,
     ont_name: str,
@@ -599,8 +658,8 @@ def generate_pattern_markdown(
         members_md = "This pattern consists of the following classes:\n\n"
         i = 0
         for cls_name in direct_classes:
-            if cls_name == "ITSThing":
-                continue
+            # if cls_name == "ITSThing":
+            #    continue
             display_cls = insert_spaces(cls_name)
             members_md += f"- [{display_cls}]({cls_name}.md)\n"
             i += 1
@@ -621,11 +680,9 @@ def generate_pattern_markdown(
             datatypes_md += "\n"
         body = members_md + props_md + datatypes_md
 
-    owl_ttl = get_source_ttl_basename(ont_name, ont)
-    shacl_ttl = get_shacl_name(ont_name) + ".ttl"
-    shacl_path = os.path.join(docs_dir, shacl_ttl)
+    owl_ttl, shacl_ttl = _pattern_ttl_pair(ont_name, ont, docs_dir)
     ttl_prefix = "" if for_index else "../"
-    if os.path.exists(shacl_path):
+    if not for_index and shacl_ttl:
         formal = (
             f"\nThe formal definition of this pattern is available in TURTLE Syntax in two files, "
             f"the [core semantics]({ttl_prefix}{owl_ttl}) and the SHACL "
@@ -633,7 +690,10 @@ def generate_pattern_markdown(
         )
     else:
         label = "ontology" if for_index else "pattern"
-        formal = f"\nThe formal definition of this {label} is available in [TURTLE Syntax]({ttl_prefix}{owl_ttl}).\n"
+        formal = (
+            f"\nThe formal definition of this {label} is available in "
+            f"[TURTLE Syntax]({ttl_prefix}{owl_ttl}).\n"
+        )
 
     if for_index:
         return top_desc + imports_md + body + formal
